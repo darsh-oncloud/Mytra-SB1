@@ -16,7 +16,7 @@ define(['N/https', 'N/log'], (https, log) => {
     // Current working scope
     // After admin adds read scopes, change to:
     // 'tickets:read organizations:read users:read'
-    const SCOPE = 'tickets:read organizations:read users:read';
+    const SCOPE = 'tickets:read';
 
     const MAX_TICKETS = 5;
     const MAX_LOG_LENGTH = 3000;
