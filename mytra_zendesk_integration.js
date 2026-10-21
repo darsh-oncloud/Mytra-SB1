@@ -1,3 +1,4 @@
+
 /**
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
@@ -11,22 +12,69 @@ define(['N/https', 'N/log'], (https, log) => {
 
     const BASE_URL = 'https://mytra.zendesk.com';
     const CLIENT_ID = 'netsuite_fsm_integration';
-    const CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
+    const CLIENT_SECRET = 'PASTE_YOUR_SECRET_HERE';
 
-    // Current working scope
-    // After admin adds read scopes, change to:
+    // First test with the existing working scope.
+    // After the administrator adds read permissions:
     // 'tickets:read organizations:read users:read'
     const SCOPE = 'tickets:read organizations:read users:read';
 
     const MAX_TICKETS = 5;
     const MAX_LOG_LENGTH = 3000;
 
-    // Avoid calling the same user/org twice
+    // Avoid duplicate lookups for the same IDs.
     const orgCache = {};
     const userCache = {};
 
     // ==========================================
-    // LOG FULL JSON IN CHUNKS
+    // SAFE ERROR LOGGING
+    // ==========================================
+
+    function safeErrorBody(body) {
+
+        if (!body) {
+            return 'Empty response body';
+        }
+
+        try {
+            const parsed = JSON.parse(body);
+
+            function redact(value) {
+
+                if (Array.isArray(value)) {
+                    return value.map(redact);
+                }
+
+                if (value && typeof value === 'object') {
+
+                    const result = {};
+
+                    Object.keys(value).forEach(key => {
+
+                        if (/token|secret|password|authorization|cookie|credential|api_key/i.test(key)) {
+                            result[key] = '[REDACTED]';
+                        } else {
+                            result[key] = redact(value[key]);
+                        }
+                    });
+
+                    return result;
+                }
+
+                return value;
+            }
+
+            return JSON.stringify(redact(parsed))
+                .substring(0, MAX_LOG_LENGTH);
+
+        } catch (e) {
+
+            return '[Non-JSON error response omitted for security]';
+        }
+    }
+
+    // ==========================================
+    // LOG SUCCESSFUL JSON IN CHUNKS
     // ==========================================
 
     function logJSON(title, data) {
@@ -38,14 +86,15 @@ define(['N/https', 'N/log'], (https, log) => {
             return;
         }
 
-        const parts = Math.ceil(
+        const totalParts = Math.ceil(
             json.length / MAX_LOG_LENGTH
         );
 
-        for (let i = 0; i < parts; i++) {
+        for (let i = 0; i < totalParts; i++) {
 
             log.audit(
-                title + ' - Part ' + (i + 1) + '/' + parts,
+                title + ' - Part ' + (i + 1) +
+                '/' + totalParts,
                 json.substring(
                     i * MAX_LOG_LENGTH,
                     (i + 1) * MAX_LOG_LENGTH
@@ -55,10 +104,16 @@ define(['N/https', 'N/log'], (https, log) => {
     }
 
     // ==========================================
-    // GENERATE ACCESS TOKEN
+    // GENERATE OAUTH ACCESS TOKEN
     // ==========================================
 
     function getAccessToken() {
+
+        log.audit('OAuth Request', {
+            endpoint: BASE_URL + '/oauth/tokens',
+            grantType: 'client_credentials',
+            requestedScope: SCOPE
+        });
 
         const response = https.post({
             url: BASE_URL + '/oauth/tokens',
@@ -76,36 +131,54 @@ define(['N/https', 'N/log'], (https, log) => {
 
         log.audit('OAuth HTTP Status', response.code);
 
-        if (Number(response.code) !== 200 &&
-            Number(response.code) !== 201) {
+        if (Number(response.code) < 200 ||
+            Number(response.code) >= 300) {
+
+            log.error('OAuth FULL ERROR RESPONSE', {
+                status: response.code,
+                requestedScope: SCOPE,
+                responseBody: safeErrorBody(response.body)
+            });
 
             throw new Error(
-                'OAuth failed. HTTP: ' + response.code +
-                '. Check credentials and scopes.'
+                'OAuth authentication failed. HTTP ' +
+                response.code +
+                '. Review OAuth FULL ERROR RESPONSE log.'
             );
         }
 
-        const data = JSON.parse(response.body);
+        const tokenData = JSON.parse(response.body);
 
-        if (!data.access_token) {
-            throw new Error('Access token not found');
+        if (!tokenData.access_token) {
+
+            log.error(
+                'OAuth Missing Access Token',
+                'OAuth response did not contain access_token'
+            );
+
+            throw new Error('Access token not returned');
         }
 
-        log.audit(
-            'OAuth Authentication Success',
-            'Access token generated'
-        );
+        log.audit('OAuth Authentication Success', {
+            status: response.code,
+            grantedScope: tokenData.scope || 'Not returned'
+        });
 
-        return data.access_token;
+        return tokenData.access_token;
     }
 
     // ==========================================
-    // GENERIC ZENDESK GET API
+    // GENERIC ZENDESK GET REQUEST
     // ==========================================
 
     function callZendeskAPI(token, endpoint, title) {
 
         try {
+
+            log.audit(title + ' - Request', {
+                method: 'GET',
+                endpoint: endpoint
+            });
 
             const response = https.get({
                 url: BASE_URL + endpoint,
@@ -115,24 +188,34 @@ define(['N/https', 'N/log'], (https, log) => {
                 }
             });
 
-            log.audit(title + ' - HTTP Status', response.code);
+            log.audit(
+                title + ' - HTTP Status',
+                response.code
+            );
 
-            if (Number(response.code) !== 200) {
+            if (Number(response.code) < 200 ||
+                Number(response.code) >= 300) {
 
-                log.error(title + ' - API Error', {
-                    status: response.code,
-                    endpoint: endpoint,
-                    message: Number(response.code) === 403
-                        ? 'Check OAuth read scope and service account permissions'
-                        : 'Zendesk GET request failed'
-                });
+                log.error(
+                    title + ' - FULL ERROR RESPONSE',
+                    {
+                        status: response.code,
+                        endpoint: endpoint,
+                        responseBody: safeErrorBody(
+                            response.body
+                        )
+                    }
+                );
 
                 return null;
             }
 
             const data = JSON.parse(response.body);
 
-            logJSON(title + ' - FULL RESPONSE', data);
+            logJSON(
+                title + ' - FULL RESPONSE',
+                data
+            );
 
             return data;
 
@@ -154,6 +237,10 @@ define(['N/https', 'N/log'], (https, log) => {
     function getOrganization(token, orgId) {
 
         if (!orgId) {
+            log.audit(
+                'Organization Skipped',
+                'Organization ID is empty'
+            );
             return;
         }
 
@@ -161,8 +248,8 @@ define(['N/https', 'N/log'], (https, log) => {
             orgCache, String(orgId)
         )) {
             log.debug(
-                'Organization Already Fetched',
-                orgId
+                'Organization Already Attempted',
+                'Organization ID: ' + orgId
             );
             return;
         }
@@ -188,9 +275,19 @@ define(['N/https', 'N/log'], (https, log) => {
     function getUser(token, userId, role) {
 
         if (!userId) {
-            log.debug(
-                role + ' Not Available',
+            log.audit(
+                role + ' Skipped',
                 'User ID is empty'
+            );
+            return;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(
+            userCache, String(userId)
+        )) {
+            log.debug(
+                'User Already Attempted',
+                'User ID: ' + userId
             );
             return;
         }
@@ -200,20 +297,10 @@ define(['N/https', 'N/log'], (https, log) => {
             'User ID: ' + userId
         );
 
-        if (Object.prototype.hasOwnProperty.call(
-            userCache, String(userId)
-        )) {
-            log.debug(
-                'User Already Fetched',
-                'User ID: ' + userId
-            );
-            return;
-        }
-
         const result = callZendeskAPI(
             token,
             '/api/v2/users/' + userId + '.json',
-            'User ' + userId
+            role + ' User ' + userId
         );
 
         userCache[userId] = result;
@@ -232,21 +319,22 @@ define(['N/https', 'N/log'], (https, log) => {
                 'Connecting to ' + BASE_URL
             );
 
-            // STEP 1: OAuth Authentication
+            // STEP 1: Authenticate
             const token = getAccessToken();
 
-            // STEP 2: Fetch Tickets
+            // STEP 2: Retrieve tickets
             const ticketData = callZendeskAPI(
                 token,
                 '/api/v2/tickets.json?per_page=' + MAX_TICKETS,
                 'Zendesk Tickets'
             );
 
-            if (!ticketData || !ticketData.tickets) {
+            if (!ticketData ||
+                !Array.isArray(ticketData.tickets)) {
 
                 log.error(
-                    'Tickets Not Found',
-                    'No ticket data returned'
+                    'Tickets Not Retrieved',
+                    'Ticket request failed or returned unexpected data'
                 );
 
                 return [];
@@ -259,30 +347,34 @@ define(['N/https', 'N/log'], (https, log) => {
                 tickets.length
             );
 
-            // STEP 3: Process Each Ticket
+            // STEP 3: Retrieve related records
             tickets.forEach((ticket, index) => {
 
                 log.audit(
                     'Processing Ticket ' + (index + 1),
-                    'Ticket ID: ' + ticket.id
+                    {
+                        ticketId: ticket.id,
+                        subject: ticket.subject,
+                        organizationId: ticket.organization_id,
+                        requesterId: ticket.requester_id,
+                        assigneeId: ticket.assignee_id
+                    }
                 );
 
-                // Full ticket JSON already logged above
-
-                // STEP 4: Get Organization
+                // Organization
                 getOrganization(
                     token,
                     ticket.organization_id
                 );
 
-                // STEP 5: Get Requester
+                // Requester
                 getUser(
                     token,
                     ticket.requester_id,
                     'Requester'
                 );
 
-                // STEP 6: Get Assignee
+                // Assignee
                 getUser(
                     token,
                     ticket.assignee_id,
@@ -293,13 +385,12 @@ define(['N/https', 'N/log'], (https, log) => {
                     'Ticket Processing Completed',
                     'Ticket ID: ' + ticket.id
                 );
-
             });
 
             log.audit(
                 'Zendesk Test Completed',
                 'Processed ' + tickets.length +
-                ' tickets and attempted related organization/user lookups'
+                ' tickets and attempted related record lookups.'
             );
 
         } catch (error) {
@@ -308,20 +399,18 @@ define(['N/https', 'N/log'], (https, log) => {
                 name: error.name,
                 message: error.message
             });
-
         }
 
         return [];
     }
 
-    // Required Map/Reduce function
+    // Required for NetSuite Map/Reduce validation.
+    // No map processing is needed for this test.
     function map(context) {
-
         log.debug(
             'Map Stage',
-            'Not required for this API test'
+            'No processing required'
         );
-
     }
 
     return {
