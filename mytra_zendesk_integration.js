@@ -11,7 +11,7 @@ define(['N/https', 'N/log'], (https, log) => {
 
     const BASE_URL = 'https://mytra.zendesk.com';
     const CLIENT_ID = 'netsuite_fsm_integration';
-    const CLIENT_SECRET = 'PASTE_YOUR_SECRET_HERE';
+    const CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
     // First test with the existing working scope.
     // After the administrator adds read permissions:
