@@ -11,7 +11,7 @@ define(['N/https', 'N/record', 'N/search', 'N/log'],
     // Use a newly rotated secret. Never put the real
     // secret in logs or share it in code.
     // Temporary Sandbox setup only.
-    const CLIENT_SECRET = 'REPLACE_WITH_ROTATED_SECRET';
+    const CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
     const SCOPE = 'tickets:read organizations:read users:read';
 
