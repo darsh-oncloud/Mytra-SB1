@@ -6,26 +6,34 @@ define(['N/https', 'N/log'], function(https, log) {
 
     var BASE_URL = 'https://mytra.zendesk.com';
     var CLIENT_ID = 'netsuite_fsm_integration';
-    var CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
+    var CLIENT_SECRET = 'PASTE_NEW_CLIENT_SECRET_HERE';
+
+    // Hardcoded NetSuite Customer
+    var CUSTOMER = {
+        name: 'Baxter Healthcare Corporation',
+        external_id: 'CUST-100001',
+        street: 'ONE BAXTER PKWY',
+        city: 'DEERFIELD',
+        state: 'IL',
+        zip: '60015'
+    };
+
+    // Hardcoded NetSuite Field Service Asset
+    var ASSET = {
+        name: 'MYT-00067-00 P1 BOT ASM MYT-00067-00-00004',
+        external_id: '224',
+        serial: 'MYT-00067-00-00004',
+        item: 'MYT-00067-00 P1 BOT ASM',
+        status: 'On Lease',
+        lease_start: '2026-10-01',
+        lease_end: '2027-05-31',
+        under_warranty: true,
+        warranty_start: '2026-10-01',
+        warranty_end: '2028-04-01'
+    };
 
     // =================================================
-    // LOG COMPLETE DATA
-    // =================================================
-    function logData(title, data) {
-        var value = JSON.stringify(data, null, 2) || 'null';
-        var size = 3500;
-        var parts = Math.ceil(value.length / size);
-
-        for (var i = 0; i < parts; i++) {
-            log.audit(
-                title + ' PART ' + (i + 1) + '/' + parts,
-                value.substring(i * size, (i + 1) * size)
-            );
-        }
-    }
-
-    // =================================================
-    // GET TOKEN
+    // OAUTH TOKEN
     // =================================================
     function getToken(scope) {
 
@@ -44,162 +52,130 @@ define(['N/https', 'N/log'], function(https, log) {
         });
 
         if (Number(res.code) !== 200) {
-            log.error('OAUTH ACCESS FAILED', {
+            log.error('OAUTH FAILED', {
                 scope: scope,
                 code: res.code,
-                response: res.body
+                body: res.body
             });
             return null;
         }
 
         var data = JSON.parse(res.body);
 
-        log.audit('OAUTH ACCESS SUCCESS', {
+        log.audit('OAUTH SUCCESS', {
             requestedScope: scope,
-            grantedScope: data.scope || '',
-            hasToken: !!data.access_token
+            grantedScope: data.scope || ''
         });
 
-        return data.access_token || null;
+        return data.access_token;
     }
 
     // =================================================
-    // GET API
+    // GENERIC API
     // =================================================
-    function getAPI(token, endpoint) {
+    function api(token, method, endpoint, payload) {
 
-        var url = endpoint.indexOf('https://') === 0
-            ? endpoint : BASE_URL + endpoint;
-
-        if (url.indexOf(BASE_URL + '/api/v2/') !== 0) {
-            throw Error('Invalid Zendesk API URL');
-        }
-
-        var res = https.get({
-            url: url,
+        var options = {
+            url: BASE_URL + endpoint,
             headers: {
                 Authorization: 'Bearer ' + token,
+                'Content-Type': 'application/json',
                 Accept: 'application/json'
             }
+        };
+
+        if (payload) {
+            options.body = JSON.stringify(payload);
+            log.audit('REQUEST PAYLOAD - ' + endpoint,
+                options.body);
+        }
+
+        var res = method === 'POST'
+            ? https.post(options)
+            : https.get(options);
+
+        var body;
+
+        try {
+            body = JSON.parse(res.body);
+        } catch (e) {
+            body = {raw: res.body};
+        }
+
+        log.audit('API RESPONSE - ' + endpoint, {
+            code: res.code,
+            data: body
         });
 
-        if (Number(res.code) !== 200) {
-            log.error('API ACCESS FAILED', {
-                endpoint: endpoint,
-                code: res.code,
-                response: res.body
-            });
+        return {
+            code: Number(res.code),
+            data: body
+        };
+    }
+
+    // =================================================
+    // CREATE OR UPDATE ORGANIZATION
+    // =================================================
+    function createOrganization(token) {
+
+        var payload = {
+            organization: {
+                name: CUSTOMER.name,
+                external_id: CUSTOMER.external_id,
+                organization_fields: {
+                    street_address: CUSTOMER.street,
+                    city: CUSTOMER.city,
+                    state: CUSTOMER.state,
+                    zip_code: CUSTOMER.zip
+                }
+            }
+        };
+
+        var result = api(
+            token,
+            'POST',
+            '/api/v2/organizations/create_or_update.json',
+            payload
+        );
+
+        if (result.code !== 200 && result.code !== 201) {
+            log.error('ORGANIZATION CREATE FAILED', result);
             return null;
         }
 
-        return JSON.parse(res.body);
-    }
+        var org = result.data.organization;
 
-    // =================================================
-    // GET ALL RECORDS WITH PAGINATION
-    // =================================================
-    function getAll(token, endpoint, property, title) {
-
-        var next = endpoint;
-        var count = 0;
-        var page = 0;
-
-        while (next) {
-
-            page++;
-
-            var data = getAPI(token, next);
-            if (!data) break;
-
-            var rows = data[property] || [];
-
-            for (var i = 0; i < rows.length; i++) {
-                count++;
-                logData(title + ' ' + count, rows[i]);
-            }
-
-            log.audit(title + ' PAGE', {
-                page: page,
-                pageCount: rows.length,
-                total: count
-            });
-
-            next = data.next_page ||
-                (data.links && data.links.next) ||
-                null;
-        }
-
-        log.audit(title + ' TOTAL', count);
-    }
-
-    // =================================================
-    // CHECK CREATE SCOPES
-    // =================================================
-    function checkPermissions() {
-
-        var orgWrite = getToken('organizations:write');
-
-        log.audit('ORGANIZATION CREATE SCOPE', {
-            scopeGranted: !!orgWrite,
-            createPermissionConfirmed: false,
-            note: 'Role permission must also allow creation'
+        log.audit('ORGANIZATION SUCCESS', {
+            zendeskId: org.id,
+            name: org.name,
+            externalId: org.external_id
         });
 
-        var assetWrite = getToken('custom_objects:write');
-
-        log.audit('ASSET CREATE SCOPE', {
-            scopeGranted: !!assetWrite,
-            createPermissionConfirmed: false,
-            note: 'Check object-specific role permissions'
-        });
+        return org;
     }
 
     // =================================================
-    // GET ORGANIZATIONS
+    // DISCOVER EXISTING ASSET OBJECT
     // =================================================
-    function getOrganizations(token) {
+    function findAssetObject(token) {
 
-        getAll(
+        var result = api(
             token,
-            '/api/v2/organizations.json',
-            'organizations',
-            'EXISTING ORGANIZATION'
-        );
-
-        getAll(
-            token,
-            '/api/v2/organization_fields.json',
-            'organization_fields',
-            'ORGANIZATION FIELD'
-        );
-
-        log.audit('ORGANIZATION CREATE DETAILS', {
-            endpoint: 'POST /api/v2/organizations.json',
-            required: ['name'],
-            additionalFields: 'See organization field logs'
-        });
-    }
-
-    // =================================================
-    // GET ASSETS AND ASSET FIELDS
-    // =================================================
-    function getAssets(token) {
-
-        var data = getAPI(
-            token,
+            'GET',
             '/api/v2/custom_objects'
         );
 
-        if (!data) return;
+        if (result.code !== 200) {
+            log.error('ASSET OBJECT LOOKUP FAILED',
+                'Unable to read custom object definitions');
+            return null;
+        }
 
-        var objects = data.custom_objects || [];
-        var found = 0;
+        var objects = result.data.custom_objects || [];
 
         for (var i = 0; i < objects.length; i++) {
 
             var obj = objects[i];
-
-            logData('CUSTOM OBJECT', obj);
 
             var name = (
                 (obj.key || '') + ' ' +
@@ -207,129 +183,153 @@ define(['N/https', 'N/log'], function(https, log) {
                 (obj.title_pluralized || '')
             ).toLowerCase();
 
-            if (name.indexOf('asset') === -1) continue;
+            if (name.indexOf('asset') !== -1) {
 
-            found++;
-
-            var key = encodeURIComponent(obj.key);
-            var base = '/api/v2/custom_objects/' + key;
-
-            log.audit('ASSET OBJECT FOUND', {
-                key: obj.key,
-                name: obj.title
-            });
-
-            getAll(
-                token,
-                base + '/records',
-                'custom_object_records',
-                'EXISTING ASSET'
-            );
-
-            getAll(
-                token,
-                base + '/fields?include_standard_fields=true',
-                'custom_object_fields',
-                'ASSET FIELD'
-            );
-
-            var metadata = getAPI(
-                token,
-                base + '?include_permissions_metadata=true'
-            );
-
-            if (metadata) {
-                logData('ASSET PERMISSION METADATA', metadata);
+                log.audit('ASSET OBJECT FOUND', obj);
+                return obj.key;
             }
-
-            var permissions = getAPI(
-                token,
-                base + '/permission_policies'
-            );
-
-            if (permissions) {
-                logData('ASSET ROLE PERMISSIONS', permissions);
-            }
-
-            log.audit('ASSET CREATE DETAILS', {
-                objectKey: obj.key,
-                endpoint: 'POST ' + base + '/records',
-                required: 'See ASSET FIELD logs',
-                permissions: 'See ASSET ROLE PERMISSIONS'
-            });
         }
 
-        log.audit('ASSET OBJECT COUNT', found);
+        log.error('ASSET OBJECT NOT FOUND',
+            'No existing custom object named Asset');
 
-        if (!found) {
-            log.audit(
-                'NO ASSET OBJECT',
-                'No custom object with asset in its name or key'
-            );
-        }
+        return null;
     }
 
     // =================================================
-    // GET EXISTING AGENTS
+    // CREATE ASSET
     // =================================================
-    function getAgents(token) {
+    function createAsset(token, objectKey, organization) {
 
-        getAll(
+        // Minimal test payload because the actual Asset
+        // custom field keys are not yet confirmed.
+        var payload = {
+            custom_object_record: {
+                name: ASSET.name,
+                external_id: ASSET.external_id
+            }
+        };
+
+        log.audit('NETSUITE ASSET SOURCE DATA', {
+            asset: ASSET,
+            organizationName: organization.name,
+            organizationZendeskId: organization.id
+        });
+
+        var endpoint = '/api/v2/custom_objects/' +
+            encodeURIComponent(objectKey) + '/records';
+
+        // Check existing Asset by NetSuite internal ID
+        var lookup = api(
             token,
-            '/api/v2/users.json?role%5B%5D=agent&role%5B%5D=admin',
-            'users',
-            'EXISTING AGENT'
+            'GET',
+            endpoint +
+            '/show_by_unique_identifier?external_id=' +
+            encodeURIComponent(ASSET.external_id)
         );
+
+        if (lookup.code === 200) {
+
+            log.audit('ASSET ALREADY EXISTS', {
+                zendeskAsset: lookup.data.custom_object_record
+            });
+
+            return;
+        }
+
+        if (lookup.code !== 404) {
+            log.error('ASSET LOOKUP FAILED',
+                'Creation skipped because lookup was unsuccessful');
+            return;
+        }
+
+        var result = api(
+            token,
+            'POST',
+            endpoint,
+            payload
+        );
+
+        if (result.code !== 201) {
+
+            log.error('ASSET CREATE FAILED', {
+                code: result.code,
+                response: result.data,
+                asset: ASSET
+            });
+
+            return;
+        }
+
+        log.audit('ASSET CREATED SUCCESSFULLY', {
+            zendeskAsset: result.data.custom_object_record,
+            netsuiteAssetId: ASSET.external_id,
+            organizationId: organization.id
+        });
     }
 
     // =================================================
     // MAP REDUCE
     // =================================================
     function getInputData() {
-        return [{ id: 1 }];
+        return [{id: 1}];
     }
 
     function map(context) {
 
         try {
 
-            log.audit('ZENDESK AUDIT STARTED', BASE_URL);
+            log.audit('ZENDESK TEST STARTED',
+                'Organization and Asset creation');
 
-            var token = getToken(
-                'organizations:read users:read'
+            // Organization token
+            var orgToken = getToken(
+                'organizations:write'
             );
 
-            if (token) {
+            if (!orgToken) return;
 
-                var currentUser = getAPI(
-                    token,
-                    '/api/v2/users/me.json'
+            var organization = createOrganization(orgToken);
+
+            if (!organization) return;
+
+            // Custom Object token
+            var assetToken = getToken(
+                'custom_objects:write'
+            );
+
+            if (!assetToken) return;
+
+            // Discover Asset object
+            var objectKey = findAssetObject(assetToken);
+
+            // Try read scope if write token cannot
+            // access object definitions.
+            if (!objectKey) {
+
+                var readToken = getToken(
+                    'custom_objects:read'
                 );
 
-                if (currentUser) {
-                    logData('AUTHENTICATED USER', currentUser.user);
+                if (readToken) {
+                    objectKey = findAssetObject(readToken);
                 }
-
-                getOrganizations(token);
-                getAgents(token);
             }
 
-            var assetToken = getToken('custom_objects:read');
-
-            if (assetToken) {
-                getAssets(assetToken);
+            if (!objectKey) {
+                log.error('ASSET CREATION SKIPPED',
+                    'Asset custom object key not available');
+                return;
             }
 
-            checkPermissions();
+            createAsset(assetToken, objectKey, organization);
 
-            log.audit(
-                'ZENDESK AUDIT COMPLETED',
-                'All available checks finished'
-            );
+            log.audit('ZENDESK TEST COMPLETED',
+                'Check organization and asset logs');
 
         } catch (e) {
 
-            log.error('ZENDESK AUDIT ERROR', {
+            log.error('TEST ERROR', {
                 name: e.name,
                 message: e.message,
                 stack: e.stack
@@ -342,7 +342,8 @@ define(['N/https', 'N/log'], function(https, log) {
     function summarize(summary) {
 
         if (summary.inputSummary.error) {
-            log.error('INPUT ERROR', summary.inputSummary.error);
+            log.error('INPUT ERROR',
+                summary.inputSummary.error);
         }
 
         summary.mapSummary.errors.iterator().each(
@@ -352,10 +353,9 @@ define(['N/https', 'N/log'], function(https, log) {
             }
         );
 
-        log.audit('FINAL SUMMARY', {
+        log.audit('TEST SUMMARY', {
             usage: summary.usage,
-            yields: summary.yields,
-            seconds: summary.seconds
+            yields: summary.yields
         });
     }
 
