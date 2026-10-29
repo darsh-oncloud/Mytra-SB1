@@ -2,27 +2,34 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  */
-define(['N/https', 'N/record', 'N/search', 'N/log'],
-(https, record, search, log) => {
+define(['N/https', 'N/log'], function(https, log) {
 
-    const BASE_URL = 'https://mytra.zendesk.com';
-    const CLIENT_ID = 'netsuite_fsm_integration';
-
-    // Use a newly rotated secret. Never put the real
-    // secret in logs or share it in code.
-    // Temporary Sandbox setup only.
-    const CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
-
-    const SCOPE = 'tickets:read organizations:read users:read';
-
-    const orgCache = {};
-    const userCache = {};
+    var BASE_URL = 'https://mytra.zendesk.com';
+    var CLIENT_ID = 'netsuite_fsm_integration';
+    var CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
     // =================================================
-    // ZENDESK AUTHENTICATION
+    // LOG COMPLETE DATA
     // =================================================
-    const getToken = () => {
-        const res = https.post({
+    function logData(title, data) {
+        var value = JSON.stringify(data, null, 2) || 'null';
+        var size = 3500;
+        var parts = Math.ceil(value.length / size);
+
+        for (var i = 0; i < parts; i++) {
+            log.audit(
+                title + ' PART ' + (i + 1) + '/' + parts,
+                value.substring(i * size, (i + 1) * size)
+            );
+        }
+    }
+
+    // =================================================
+    // GET TOKEN
+    // =================================================
+    function getToken(scope) {
+
+        var res = https.post({
             url: BASE_URL + '/oauth/tokens',
             headers: {
                 'Content-Type': 'application/json',
@@ -32,38 +39,44 @@ define(['N/https', 'N/record', 'N/search', 'N/log'],
                 grant_type: 'client_credentials',
                 client_id: CLIENT_ID,
                 client_secret: CLIENT_SECRET,
-                scope: SCOPE
+                scope: scope
             })
         });
 
         if (Number(res.code) !== 200) {
-            throw Error('Zendesk OAuth failed: HTTP ' + res.code);
+            log.error('OAUTH ACCESS FAILED', {
+                scope: scope,
+                code: res.code,
+                response: res.body
+            });
+            return null;
         }
 
-        const data = JSON.parse(res.body);
+        var data = JSON.parse(res.body);
 
-        if (!data.access_token) {
-            throw Error('Zendesk OAuth token missing');
-        }
+        log.audit('OAUTH ACCESS SUCCESS', {
+            requestedScope: scope,
+            grantedScope: data.scope || '',
+            hasToken: !!data.access_token
+        });
 
-        log.audit('Zendesk OAuth Success', 'Connected');
-        return data.access_token;
-    };
+        return data.access_token || null;
+    }
 
     // =================================================
-    // GENERIC ZENDESK GET
+    // GET API
     // =================================================
-    const getAPI = (token, endpoint) => {
-        const url = endpoint.startsWith('https://')
-            ? endpoint
-            : BASE_URL + endpoint;
+    function getAPI(token, endpoint) {
 
-        if (!url.startsWith(BASE_URL + '/api/v2/')) {
-            throw Error('Unexpected Zendesk API URL');
+        var url = endpoint.indexOf('https://') === 0
+            ? endpoint : BASE_URL + endpoint;
+
+        if (url.indexOf(BASE_URL + '/api/v2/') !== 0) {
+            throw Error('Invalid Zendesk API URL');
         }
 
-        const res = https.get({
-            url,
+        var res = https.get({
+            url: url,
             headers: {
                 Authorization: 'Bearer ' + token,
                 Accept: 'application/json'
@@ -71,371 +84,284 @@ define(['N/https', 'N/record', 'N/search', 'N/log'],
         });
 
         if (Number(res.code) !== 200) {
-            throw Error(
-                'Zendesk GET failed: HTTP ' + res.code +
-                ' - ' + endpoint
-            );
+            log.error('API ACCESS FAILED', {
+                endpoint: endpoint,
+                code: res.code,
+                response: res.body
+            });
+            return null;
         }
 
         return JSON.parse(res.body);
-    };
+    }
 
     // =================================================
-    // GET ORGANIZATION
+    // GET ALL RECORDS WITH PAGINATION
     // =================================================
-    const getOrganization = (token, id) => {
-        if (!id) return null;
+    function getAll(token, endpoint, property, title) {
 
-        if (!Object.prototype.hasOwnProperty.call(
-            orgCache, String(id)
-        )) {
-            const data = getAPI(
-                token,
-                '/api/v2/organizations/' + id + '.json'
-            );
-
-            orgCache[id] = data.organization || null;
-        }
-
-        return orgCache[id];
-    };
-
-    // =================================================
-    // GET ZENDESK USER
-    // =================================================
-    const getUser = (token, id) => {
-        if (!id) return null;
-
-        if (!Object.prototype.hasOwnProperty.call(
-            userCache, String(id)
-        )) {
-            const data = getAPI(
-                token,
-                '/api/v2/users/' + id + '.json'
-            );
-
-            userCache[id] = data.user || null;
-        }
-
-        return userCache[id];
-    };
-
-    // =================================================
-    // INPUT: RETRIEVE ALL ZENDESK TICKETS
-    // =================================================
-    const getInputData = () => {
-        const token = getToken();
-        const tickets = [];
-
-        let next = '/api/v2/tickets.json?per_page=100';
-        let page = 0;
+        var next = endpoint;
+        var count = 0;
+        var page = 0;
 
         while (next) {
+
             page++;
 
-            const data = getAPI(token, next);
+            var data = getAPI(token, next);
+            if (!data) break;
 
-            if (!Array.isArray(data.tickets)) {
-                throw Error('Unexpected ticket API response');
+            var rows = data[property] || [];
+
+            for (var i = 0; i < rows.length; i++) {
+                count++;
+                logData(title + ' ' + count, rows[i]);
             }
 
-            data.tickets.forEach(t => {
-                // Skip deleted tickets.
-                if (t.status === 'deleted') return;
-
-                const org = getOrganization(
-                    token, t.organization_id
-                );
-
-                const requester = getUser(
-                    token, t.requester_id
-                );
-
-                const assignee = getUser(
-                    token, t.assignee_id
-                );
-
-                tickets.push({
-                    ticket: t,
-                    organization: org,
-                    requester,
-                    assignee
-                });
+            log.audit(title + ' PAGE', {
+                page: page,
+                pageCount: rows.length,
+                total: count
             });
 
-            log.audit('Zendesk Page Retrieved', {
-                page,
-                ticketsOnPage: data.tickets.length,
-                totalTickets: tickets.length
-            });
-
-            next = data.next_page || null;
+            next = data.next_page ||
+                (data.links && data.links.next) ||
+                null;
         }
 
-        log.audit('Zendesk Retrieval Completed', {
-            totalTickets: tickets.length,
-            pages: page
+        log.audit(title + ' TOTAL', count);
+    }
+
+    // =================================================
+    // CHECK CREATE SCOPES
+    // =================================================
+    function checkPermissions() {
+
+        var orgWrite = getToken('organizations:write');
+
+        log.audit('ORGANIZATION CREATE SCOPE', {
+            scopeGranted: !!orgWrite,
+            createPermissionConfirmed: false,
+            note: 'Role permission must also allow creation'
         });
 
-        return tickets;
-    };
+        var assetWrite = getToken('custom_objects:write');
+
+        log.audit('ASSET CREATE SCOPE', {
+            scopeGranted: !!assetWrite,
+            createPermissionConfirmed: false,
+            note: 'Check object-specific role permissions'
+        });
+    }
 
     // =================================================
-    // FIND NETSUITE EMPLOYEE BY EMAIL
+    // GET ORGANIZATIONS
     // =================================================
-    const findEmployee = (email) => {
-        if (!email) return null;
+    function getOrganizations(token) {
 
-        const results = search.create({
-            type: search.Type.EMPLOYEE,
-            filters: [
-                ['email', 'is', email],
-                'AND',
-                ['isinactive', 'is', 'F']
-            ],
-            columns: ['internalid']
-        }).run().getRange({start: 0, end: 2});
+        getAll(
+            token,
+            '/api/v2/organizations.json',
+            'organizations',
+            'EXISTING ORGANIZATION'
+        );
 
-        return results.length === 1
-            ? Number(results[0].id)
-            : null;
-    };
+        getAll(
+            token,
+            '/api/v2/organization_fields.json',
+            'organization_fields',
+            'ORGANIZATION FIELD'
+        );
 
-    // =================================================
-    // FIND NETSUITE CUSTOMER BY COMPANY NAME
-    // =================================================
-    const findCustomer = (name) => {
-        if (!name) return null;
-
-        const results = search.create({
-            type: search.Type.CUSTOMER,
-            filters: [
-                ['companyname', 'is', name],
-                'AND',
-                ['isinactive', 'is', 'F']
-            ],
-            columns: ['internalid']
-        }).run().getRange({start: 0, end: 2});
-
-        return results.length === 1
-            ? Number(results[0].id)
-            : null;
-    };
+        log.audit('ORGANIZATION CREATE DETAILS', {
+            endpoint: 'POST /api/v2/organizations.json',
+            required: ['name'],
+            additionalFields: 'See organization field logs'
+        });
+    }
 
     // =================================================
-    // FIND EXISTING TASK
+    // GET ASSETS AND ASSET FIELDS
     // =================================================
-    const findTask = (ticketId) => {
-        const titlePrefix = '[Zendesk #' + ticketId + ']';
+    function getAssets(token) {
 
-        const results = search.create({
-            type: search.Type.TASK,
-            filters: [
-                ['title', 'startswith', titlePrefix]
-            ],
-            columns: ['internalid']
-        }).run().getRange({start: 0, end: 1});
+        var data = getAPI(
+            token,
+            '/api/v2/custom_objects'
+        );
 
-        return results.length
-            ? results[0].id
-            : null;
-    };
+        if (!data) return;
 
-    // =================================================
-    // MAP PRIORITY
-    // =================================================
-    const mapPriority = (value) => {
-        switch (value) {
-            case 'low': return 'LOW';
-            case 'high':
-            case 'urgent': return 'HIGH';
-            default: return 'MEDIUM';
+        var objects = data.custom_objects || [];
+        var found = 0;
+
+        for (var i = 0; i < objects.length; i++) {
+
+            var obj = objects[i];
+
+            logData('CUSTOM OBJECT', obj);
+
+            var name = (
+                (obj.key || '') + ' ' +
+                (obj.title || '') + ' ' +
+                (obj.title_pluralized || '')
+            ).toLowerCase();
+
+            if (name.indexOf('asset') === -1) continue;
+
+            found++;
+
+            var key = encodeURIComponent(obj.key);
+            var base = '/api/v2/custom_objects/' + key;
+
+            log.audit('ASSET OBJECT FOUND', {
+                key: obj.key,
+                name: obj.title
+            });
+
+            getAll(
+                token,
+                base + '/records',
+                'custom_object_records',
+                'EXISTING ASSET'
+            );
+
+            getAll(
+                token,
+                base + '/fields?include_standard_fields=true',
+                'custom_object_fields',
+                'ASSET FIELD'
+            );
+
+            var metadata = getAPI(
+                token,
+                base + '?include_permissions_metadata=true'
+            );
+
+            if (metadata) {
+                logData('ASSET PERMISSION METADATA', metadata);
+            }
+
+            var permissions = getAPI(
+                token,
+                base + '/permission_policies'
+            );
+
+            if (permissions) {
+                logData('ASSET ROLE PERMISSIONS', permissions);
+            }
+
+            log.audit('ASSET CREATE DETAILS', {
+                objectKey: obj.key,
+                endpoint: 'POST ' + base + '/records',
+                required: 'See ASSET FIELD logs',
+                permissions: 'See ASSET ROLE PERMISSIONS'
+            });
         }
-    };
+
+        log.audit('ASSET OBJECT COUNT', found);
+
+        if (!found) {
+            log.audit(
+                'NO ASSET OBJECT',
+                'No custom object with asset in its name or key'
+            );
+        }
+    }
 
     // =================================================
-    // MAP: CREATE NETSUITE TASK
+    // GET EXISTING AGENTS
     // =================================================
-    const map = (context) => {
-        const data = JSON.parse(context.value);
-        const t = data.ticket;
-        const org = data.organization;
-        const requester = data.requester;
-        const assignee = data.assignee;
+    function getAgents(token) {
+
+        getAll(
+            token,
+            '/api/v2/users.json?role%5B%5D=agent&role%5B%5D=admin',
+            'users',
+            'EXISTING AGENT'
+        );
+    }
+
+    // =================================================
+    // MAP REDUCE
+    // =================================================
+    function getInputData() {
+        return [{ id: 1 }];
+    }
+
+    function map(context) {
 
         try {
-            // Check existing task
-            const existingId = findTask(t.id);
 
-            if (existingId) {
-                log.audit('TASK SKIPPED - EXISTS', {
-                    zendeskId: t.id,
-                    netsuiteTaskId: existingId
-                });
+            log.audit('ZENDESK AUDIT STARTED', BASE_URL);
 
-                context.write({
-                    key: 'skipped',
-                    value: String(t.id)
-                });
-                return;
+            var token = getToken(
+                'organizations:read users:read'
+            );
+
+            if (token) {
+
+                var currentUser = getAPI(
+                    token,
+                    '/api/v2/users/me.json'
+                );
+
+                if (currentUser) {
+                    logData('AUTHENTICATED USER', currentUser.user);
+                }
+
+                getOrganizations(token);
+                getAgents(token);
             }
 
-            // Find related NetSuite records
-            const employeeId = assignee
-                ? findEmployee(assignee.email)
-                : null;
+            var assetToken = getToken('custom_objects:read');
 
-            const customerId = org
-                ? findCustomer(org.name)
-                : null;
-
-            // Prepare description
-            const details = [
-                '--- ZENDESK TICKET ---',
-                'Ticket ID: ' + t.id,
-                'Subject: ' + (t.subject || ''),
-                'Description: ' + (t.description || ''),
-                'Status: ' + (t.status || ''),
-                'Type: ' + (t.type || ''),
-                'Priority: ' + (t.priority || ''),
-                'Created: ' + (t.created_at || ''),
-                'Updated: ' + (t.updated_at || ''),
-
-                '',
-                '--- ORGANIZATION ---',
-                'Name: ' + (org ? org.name : ''),
-                'Organization ID: ' + (t.organization_id || ''),
-
-                '',
-                '--- REQUESTER ---',
-                'Name: ' + (requester ? requester.name : ''),
-                'Email: ' + (requester ? requester.email : ''),
-
-                '',
-                '--- ASSIGNEE ---',
-                'Name: ' + (assignee ? assignee.name : 'Unassigned'),
-                'Email: ' + (assignee ? assignee.email : ''),
-                'NetSuite Employee ID: ' + (employeeId || ''),
-
-                '',
-                'Group ID: ' + (t.group_id || ''),
-                'Zendesk URL: ' + BASE_URL +
-                    '/agent/tickets/' + t.id
-            ].join('\n');
-
-            // Create CRM Task
-            const task = record.create({
-                type: record.Type.TASK,
-                isDynamic: false
-            });
-
-            task.setValue({
-                fieldId: 'title',
-                value: '[Zendesk #' + t.id + '] ' +
-                    (t.subject || 'No Subject')
-            });
-
-            task.setValue({
-                fieldId: 'message',
-                value: details
-            });
-
-            task.setValue({
-                fieldId: 'priority',
-                value: mapPriority(t.priority)
-            });
-
-            // Initial import: no automatic FSM closure.
-            task.setValue({
-                fieldId: 'status',
-                value: 'NOTSTART'
-            });
-
-            task.setValue({
-                fieldId: 'sendemail',
-                value: false
-            });
-
-            if (employeeId) {
-                task.setValue({
-                    fieldId: 'assigned',
-                    value: employeeId
-                });
+            if (assetToken) {
+                getAssets(assetToken);
             }
 
-            if (customerId) {
-                task.setValue({
-                    fieldId: 'company',
-                    value: customerId
-                });
-            }
+            checkPermissions();
 
-            const taskId = task.save({
-                enableSourcing: true,
-                ignoreMandatoryFields: false
-            });
-
-            log.audit('NETSUITE TASK CREATED', {
-                zendeskId: t.id,
-                taskId,
-                title: t.subject,
-                organization: org ? org.name : '',
-                customerId: customerId || '',
-                assignee: assignee ? assignee.name : '',
-                employeeId: employeeId || ''
-            });
-
-            context.write({
-                key: 'created',
-                value: String(taskId)
-            });
+            log.audit(
+                'ZENDESK AUDIT COMPLETED',
+                'All available checks finished'
+            );
 
         } catch (e) {
-            log.error('TASK CREATION FAILED', {
-                zendeskId: t.id,
+
+            log.error('ZENDESK AUDIT ERROR', {
                 name: e.name,
-                message: e.message
+                message: e.message,
+                stack: e.stack
             });
 
             throw e;
         }
-    };
+    }
 
-    // =================================================
-    // SUMMARY
-    // =================================================
-    const summarize = (summary) => {
-        let created = 0;
-        let skipped = 0;
-        let failed = 0;
+    function summarize(summary) {
 
-        summary.output.iterator().each((key) => {
-            if (key === 'created') created++;
-            if (key === 'skipped') skipped++;
-            return true;
-        });
+        if (summary.inputSummary.error) {
+            log.error('INPUT ERROR', summary.inputSummary.error);
+        }
 
         summary.mapSummary.errors.iterator().each(
-            (key, error) => {
-                failed++;
-                log.error('Map Error - ' + key, error);
+            function(key, error) {
+                log.error('MAP ERROR ' + key, error);
                 return true;
             }
         );
 
-        if (summary.inputSummary.error) {
-            log.error(
-                'Zendesk Input Error',
-                summary.inputSummary.error
-            );
-        }
-
-        log.audit('ZENDESK TASK SYNC COMPLETED', {
-            created,
-            skipped,
-            failed
+        log.audit('FINAL SUMMARY', {
+            usage: summary.usage,
+            yields: summary.yields,
+            seconds: summary.seconds
         });
-    };
+    }
 
-    return {getInputData, map, summarize};
+    return {
+        getInputData: getInputData,
+        map: map,
+        summarize: summarize
+    };
 });
