@@ -47,6 +47,7 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
             ASSET_NAME: 'name',
             ASSET_TRANSACTION: 'custrecord_nx_asset_transaction', // Link to Transfer Order
             ASSET_CUSTOMER: 'custrecord_nx_asset_customer',       // Customer link on Asset
+            ASSET_PARENT: 'custrecord_nx_asset_parent',           // Parent Asset link on Child Asset
             
             // Task Fields
             TASK_COMPANY: 'company',                // Standard NetSuite Customer/Entity field (FSM Mobile Customer Header)
@@ -209,7 +210,7 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
                 }) || fromLocationText;
 
                 // Extract Serial Number from Inventory Detail / Line / Generated serial
-                const serialNumber = getSerialNumberFromLine(newRecord, i) || (`Robot_TO${toId}_L${i + 1}`);
+                const serialNumber = getSerialNumberFromLine(newRecord, i) || (`BOT_TO${toId}_L${i + 1}`);
 
                 // Check for duplicate task on EDIT
                 const alreadyExists = existingTasks.some((task) => {
@@ -223,7 +224,7 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
 
                 log.audit('Trigger Met', `Line ${i + 1}: Task Type '${taskType}' found for Item '${itemText}' (Qty: ${quantity}, Serial: ${serialNumber}). Creating Asset & Task...`);
 
-                // Step 1: Create Field Service Asset Record linked to Customer, Transfer Order, and TO custom fields
+                // Step 1: Create Parent Field Service Asset Record linked to Customer, Transfer Order, and TO custom fields
                 const assetId = createFieldServiceAsset({
                     itemId: itemId,
                     itemText: itemText,
@@ -232,6 +233,55 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
                     customerId: customerInfo.id,
                     assetCustomFields: assetCustomFields
                 });
+
+                // Step 1b: Resolve components and create Child Assets for each component of the parent item
+                const components = getItemComponents(itemId, itemText);
+                const childAssetsInfo = [];
+
+                if (components && components.length > 0) {
+                    components.forEach((comp) => {
+                        const compQty = comp.quantity || 1;
+                        for (let q = 0; q < compQty; q++) {
+                            const childSerial = compQty > 1
+                                ? `${serialNumber}-${comp.name}-${q + 1}`
+                                : `${serialNumber}-${comp.name}`;
+
+                            const childAssetId = createChildAsset({
+                                parentAssetId: assetId,
+                                parentAssetName: `${itemText} ${serialNumber}`,
+                                compItemId: comp.id,
+                                compItemText: comp.name,
+                                compDesc: comp.description,
+                                childSerial: childSerial,
+                                toId: toId,
+                                customerId: customerInfo.id,
+                                assetCustomFields: assetCustomFields
+                            });
+
+                            childAssetsInfo.push({
+                                id: childAssetId,
+                                name: comp.name,
+                                serial: childSerial,
+                                quantity: 1,
+                                description: comp.description
+                            });
+                        }
+                    });
+                    log.audit('Child Assets Created', `Created ${childAssetsInfo.length} child assets for Parent Asset #${assetId} (${itemText})`);
+                }
+
+                // Format components block for Task Description
+                let componentsBlock = '';
+                if (childAssetsInfo.length > 0) {
+                    componentsBlock = [
+                        `• BOT Components & Child Assets (${childAssetsInfo.length} items):`,
+                        ...childAssetsInfo.map((ca, idx) =>
+                            `  ${idx + 1}. ${ca.name} (Qty: ${ca.quantity} ea, Serial: ${ca.serial})${ca.id ? ` [Asset #${ca.id}]` : ''}`
+                        )
+                    ].join('\n');
+                } else {
+                    componentsBlock = `• BOT Components: Single Unit (No sub-components defined)`;
+                }
 
                 // Concise preview title for FSM mobile card
                 const displayTo = tranId && tranId.toString().startsWith('TO') ? tranId : ('TO #' + tranId);
@@ -248,11 +298,12 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
                     `• Destination Location: ${toLocationText}`,
                     `• Assigned Employee / Driver: ${employeeText}`,
                     ``,
-                    `--- ITEM & ROBOT PICK DETAILS ---`,
+                    `--- ITEM & BOT PICK DETAILS ---`,
                     `• Item: ${itemText}`,
                     `• Description: ${lineDescription || 'N/A'}`,
                     `• Quantity: ${quantity} ${units}`.trim(),
-                    `• Robot / Serial #: ${serialNumber}`,
+                    `• BOT / Serial #: ${serialNumber}`,
+                    componentsBlock,
                     ``,
                     `--- ASSET & WARRANTY DETAILS ---`,
                     `• Asset Status: ${assetStatusText || 'N/A'}`,
@@ -261,7 +312,7 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
                     `• Lease Period: ${leaseStartText || 'N/A'} to ${leaseEndText || 'N/A'}`,
                     ``,
                     `--- WORKFLOW INSTRUCTIONS ---`,
-                    `1. Robot Pick: Pick skid/item (${itemText}) in ${lineLocationText} warehouse and stage for transport.`,
+                    `1. BOT Pick: Pick skid/item (${itemText}) in ${lineLocationText} warehouse and stage for transport. Verify all ${childAssetsInfo.length > 0 ? childAssetsInfo.length + ' ' : ''}component child assets.`,
                     `2. Transport & Delivery: Deliver to customer site: ${customerInfo.name || 'Customer Site'} (${toLocationText}).`,
                     `3. Mark Complete: Complete the task upon successful delivery and setup.`
                 ].join('\n');
@@ -290,7 +341,7 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
                     lineIndex: i + 1
                 });
 
-                log.audit('FSM Records Created Successfully', `Line ${i + 1}: Created Asset ID #${assetId} & Task ID #${taskId} (Form ${taskFormId}) for TO ${tranId}`);
+                log.audit('FSM Records Created Successfully', `Line ${i + 1}: Created Parent Asset ID #${assetId} (${childAssetsInfo.length} child assets) & Task ID #${taskId} (Form ${taskFormId}) for TO ${tranId}`);
             }
 
         } catch (error) {
@@ -470,7 +521,7 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
             isDynamic: true
         });
 
-        // Set Name: e.g. "BOT ASM MYT-00067-00-00001 Robot_TO1024_L1"
+        // Set Name: e.g. "BOT ASM MYT-00067-00-00001 BOT_TO1024_L1"
         const assetName = `${params.itemText} ${params.serialNumber}`;
         assetRec.setValue({
             fieldId: CONFIG.FIELDS.ASSET_NAME,
@@ -541,8 +592,347 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
             ignoreMandatoryFields: true
         });
 
+        // Ensure Transfer Order link is directly committed to Asset
+        if (params.toId) {
+            try {
+                record.submitFields({
+                    type: CONFIG.ASSET_RECORD_TYPE,
+                    id: assetId,
+                    values: { custrecord_nx_asset_transaction: params.toId },
+                    options: { ignoreMandatoryFields: true }
+                });
+            } catch (atErr) {
+                log.debug('Submit Asset Transaction Note', atErr.message);
+            }
+        }
+
         log.debug('Asset Created', `Asset Record ID: ${assetId} with Serial: ${params.serialNumber} linked to TO ID: ${params.toId}`);
         return assetId;
+    };
+
+    /**
+     * Creates a Child Field Service Asset record (customrecord_nx_asset) linked to a parent Asset.
+     */
+    const createChildAsset = (params) => {
+        try {
+            const childRec = record.create({
+                type: CONFIG.ASSET_RECORD_TYPE,
+                isDynamic: true
+            });
+
+            const childName = `${params.compItemText} (${params.childSerial})`;
+            childRec.setValue({
+                fieldId: CONFIG.FIELDS.ASSET_NAME,
+                value: childName
+            });
+
+            if (params.compItemId) {
+                try {
+                    childRec.setValue({
+                        fieldId: CONFIG.FIELDS.ASSET_ITEM,
+                        value: params.compItemId
+                    });
+                } catch (e) {
+                    log.debug('Set Child Asset Item Note', e.message);
+                }
+            }
+
+            childRec.setValue({
+                fieldId: CONFIG.FIELDS.ASSET_SERIAL,
+                value: params.childSerial
+            });
+
+            if (params.customerId) {
+                try {
+                    childRec.setValue({
+                        fieldId: CONFIG.FIELDS.ASSET_CUSTOMER,
+                        value: params.customerId
+                    });
+                } catch (e) {
+                    log.debug('Set Child Asset Customer Note', e.message);
+                }
+            }
+
+            if (params.toId) {
+                try {
+                    childRec.setValue({
+                        fieldId: CONFIG.FIELDS.ASSET_TRANSACTION,
+                        value: params.toId
+                    });
+                } catch (e) {
+                    log.debug('Set Child Asset Transaction Note', e.message);
+                }
+            }
+
+            // Set Parent Asset Link
+            if (params.parentAssetId) {
+                const parentFieldCandidates = [
+                    CONFIG.FIELDS.ASSET_PARENT,
+                    'custrecord_nx_asset_parent',
+                    'custrecord_nx_parent_asset',
+                    'parent',
+                    'custrecord_asset_parent',
+                    'custrecord_parent_asset'
+                ];
+                for (let f = 0; f < parentFieldCandidates.length; f++) {
+                    try {
+                        childRec.setValue({
+                            fieldId: parentFieldCandidates[f],
+                            value: params.parentAssetId
+                        });
+                        break;
+                    } catch (pe) { }
+                }
+            }
+
+            // Map Transfer Order fields to Child Asset
+            if (params.assetCustomFields) {
+                Object.keys(params.assetCustomFields).forEach((assetField) => {
+                    const val = params.assetCustomFields[assetField];
+                    if (val !== null && val !== undefined && val !== '') {
+                        try {
+                            childRec.setValue({
+                                fieldId: assetField,
+                                value: val
+                            });
+                        } catch (mapErr) { }
+                    }
+                });
+            }
+
+            const childAssetId = childRec.save({
+                enableSourcing: true,
+                ignoreMandatoryFields: true
+            });
+
+            // Ensure parent asset link and transaction are committed directly via submitFields
+            const submitFieldsToTry = [
+                CONFIG.FIELDS.ASSET_PARENT,
+                'custrecord_nx_asset_parent',
+                'custrecord_nx_parent_asset',
+                'parent',
+                'custrecord_asset_parent',
+                'custrecord_parent_asset'
+            ];
+            for (let s = 0; s < submitFieldsToTry.length; s++) {
+                try {
+                    const updateObj = {};
+                    updateObj[submitFieldsToTry[s]] = params.parentAssetId;
+                    record.submitFields({
+                        type: CONFIG.ASSET_RECORD_TYPE,
+                        id: childAssetId,
+                        values: updateObj,
+                        options: { ignoreMandatoryFields: true }
+                    });
+                    break;
+                } catch (se) { }
+            }
+
+            if (params.toId) {
+                try {
+                    record.submitFields({
+                        type: CONFIG.ASSET_RECORD_TYPE,
+                        id: childAssetId,
+                        values: { custrecord_nx_asset_transaction: params.toId },
+                        options: { ignoreMandatoryFields: true }
+                    });
+                } catch (te) { }
+            }
+
+            log.audit('Child Asset Created', `Created Child Asset ID #${childAssetId} (${childName}) linked to Parent Asset #${params.parentAssetId}`);
+            return childAssetId;
+        } catch (err) {
+            log.error('Error Creating Child Asset', `Comp: ${params.compItemText}, Parent: ${params.parentAssetId}, Error: ${err.message}`);
+            return null;
+        }
+    };
+
+    /**
+     * Resolves component items for an assembly item.
+     * Strategy:
+     * 1. Search item members (memberitem, memberquantity, memberdescr)
+     * 2. Assembly Record load (member sublist)
+     * 3. Advanced BOM Search (bomrevisioncomponent)
+     * 4. Fallback lookup for known item BOMs (e.g. MYT-00067-00 from Cost Revaluation ICR1287:
+     *    MYT-00242-01, MYT-00414-00, MYT-00440-01, MYT-00476-00, MYT-00477-00, MYT-08128-00)
+     */
+    const getItemComponents = (itemId, itemText) => {
+        const components = [];
+        if (!itemId) return components;
+
+        // Tier 1: Item Member Search (Standard NetSuite BOM)
+        try {
+            const memberSearch = search.create({
+                type: search.Type.ITEM,
+                filters: [
+                    ['internalid', 'anyof', itemId]
+                ],
+                columns: [
+                    search.createColumn({ name: 'memberitem' }),
+                    search.createColumn({ name: 'memberquantity' }),
+                    search.createColumn({ name: 'memberdescr' })
+                ]
+            });
+
+            memberSearch.run().each((res) => {
+                const compId = res.getValue({ name: 'memberitem' });
+                const compText = res.getText({ name: 'memberitem' }) || compId;
+                const compQty = parseFloat(res.getValue({ name: 'memberquantity' })) || 1;
+                const compDesc = res.getValue({ name: 'memberdescr' }) || '';
+                if (compId) {
+                    components.push({
+                        id: compId,
+                        name: compText,
+                        quantity: compQty,
+                        description: compDesc
+                    });
+                }
+                return true;
+            });
+
+            if (components.length > 0) {
+                log.audit('Components Sourced (Item Member Search)', `Found ${components.length} components for Item ID ${itemId}`);
+                return components;
+            }
+        } catch (e1) {
+            log.debug('Item Member Search Note', e1.message);
+        }
+
+        // Tier 2: Assembly Record Load Fallback
+        try {
+            let recType = record.Type.ASSEMBLY_ITEM;
+            try {
+                const typeLookup = search.lookupFields({
+                    type: search.Type.ITEM,
+                    id: itemId,
+                    columns: ['recordtype']
+                });
+                if (typeLookup && typeLookup.recordtype) {
+                    recType = typeLookup.recordtype;
+                }
+            } catch (le) { }
+
+            const assemblyRec = record.load({
+                type: recType,
+                id: itemId,
+                isDynamic: false
+            });
+
+            const memberCount = assemblyRec.getLineCount({ sublistId: 'member' });
+            for (let m = 0; m < memberCount; m++) {
+                const compId = assemblyRec.getSublistValue({ sublistId: 'member', fieldId: 'item', line: m });
+                const compText = assemblyRec.getSublistText({ sublistId: 'member', fieldId: 'item', line: m }) || ('Item_' + compId);
+                const compQty = parseFloat(assemblyRec.getSublistValue({ sublistId: 'member', fieldId: 'quantity', line: m })) || 1;
+                const compDesc = assemblyRec.getSublistValue({ sublistId: 'member', fieldId: 'memberdescr', line: m }) || '';
+                if (compId) {
+                    components.push({
+                        id: compId,
+                        name: compText,
+                        quantity: compQty,
+                        description: compDesc
+                    });
+                }
+            }
+
+            if (components.length > 0) {
+                log.audit('Components Sourced (Assembly Record Load)', `Found ${components.length} components for Item ID ${itemId} (${recType})`);
+                return components;
+            }
+        } catch (e2) {
+            log.debug('Assembly Record Load Note', e2.message);
+        }
+
+        // Tier 3: Advanced BOM Search (bomrevisioncomponent)
+        try {
+            const bomCompSearch = search.create({
+                type: 'bomrevisioncomponent',
+                filters: [
+                    ['billofmaterials.assembly', 'anyof', itemId]
+                ],
+                columns: [
+                    search.createColumn({ name: 'item' }),
+                    search.createColumn({ name: 'bomquantity' }),
+                    search.createColumn({ name: 'description' })
+                ]
+            });
+
+            bomCompSearch.run().each((res) => {
+                const compId = res.getValue({ name: 'item' });
+                const compText = res.getText({ name: 'item' }) || compId;
+                const compQty = parseFloat(res.getValue({ name: 'bomquantity' })) || 1;
+                const compDesc = res.getValue({ name: 'description' }) || '';
+                if (compId) {
+                    components.push({
+                        id: compId,
+                        name: compText,
+                        quantity: compQty,
+                        description: compDesc
+                    });
+                }
+                return true;
+            });
+
+            if (components.length > 0) {
+                log.audit('Components Sourced (BOM Revision Component Search)', `Found ${components.length} components for Item ID ${itemId}`);
+                return components;
+            }
+        } catch (e3) {
+            log.debug('Advanced BOM Search Note', e3.message);
+        }
+
+        // Tier 4: Fallback Known Component Mapping for Assembly Items (e.g. MYT-00067-00 from ICR1287)
+        // Sourced from Inventory Cost Revaluation ICR1287 Cost Components:
+        // MYT-00242-01, MYT-00414-00, MYT-00440-01, MYT-00476-00, MYT-00477-00, MYT-08128-00
+        const knownItemMaps = {
+            'MYT-00067': [
+                { name: 'MYT-00242-01', quantity: 1, description: 'Component MYT-00242-01' },
+                { name: 'MYT-00414-00', quantity: 1, description: 'Component MYT-00414-00' },
+                { name: 'MYT-00440-01', quantity: 1, description: 'Component MYT-00440-01' },
+                { name: 'MYT-00476-00', quantity: 1, description: 'Component MYT-00476-00' },
+                { name: 'MYT-00477-00', quantity: 1, description: 'Component MYT-00477-00' },
+                { name: 'MYT-08128-00', quantity: 1, description: 'Component MYT-08128-00' }
+            ]
+        };
+
+        const itemStr = (itemText || '') + ' ' + (itemId || '');
+        const matchedPrefix = Object.keys(knownItemMaps).find(prefix => itemStr.includes(prefix));
+
+        if (matchedPrefix) {
+            log.audit('Components Sourced (Known Item BOM Mapping)', `Matched prefix '${matchedPrefix}' for Item '${itemStr}'`);
+            const fallbackList = knownItemMaps[matchedPrefix];
+
+            fallbackList.forEach((c) => {
+                let resolvedId = null;
+                let resolvedDesc = c.description;
+                try {
+                    const itemLookup = search.create({
+                        type: search.Type.ITEM,
+                        filters: [
+                            ['itemid', 'is', c.name]
+                        ],
+                        columns: ['internalid', 'displayname', 'salesdescription']
+                    });
+                    itemLookup.run().each((res) => {
+                        resolvedId = res.id;
+                        resolvedDesc = res.getValue({ name: 'salesdescription' }) ||
+                                       res.getValue({ name: 'displayname' }) ||
+                                       c.description;
+                        return false;
+                    });
+                } catch (le) {
+                    log.debug('Component ID Lookup Note', le.message);
+                }
+
+                components.push({
+                    id: resolvedId || null,
+                    name: c.name,
+                    quantity: c.quantity,
+                    description: resolvedDesc
+                });
+            });
+        }
+
+        return components;
     };
 
     /**
@@ -665,29 +1055,43 @@ define(['N/record', 'N/log', 'N/search', 'N/runtime'], (record, log, search, run
         });
 
         // Ensure Transfer Order link is committed directly to database (bypassing any custom form restrictions)
+        // 1. Submit NextService Created From (custevent_nx_created_from)
         try {
             record.submitFields({
                 type: record.Type.TASK,
                 id: taskId,
-                values: {
-                    transaction: params.toId,
-                    custevent_nx_created_from: params.toId
-                },
+                values: { custevent_nx_created_from: params.toId },
                 options: { ignoreMandatoryFields: true }
             });
-        } catch (subErr) {
+        } catch (subErr1) {
+            log.debug('Submit custevent_nx_created_from note', subErr1.message);
+        }
+
+        // 2. Submit standard transaction if allowed
+        try {
+            record.submitFields({
+                type: record.Type.TASK,
+                id: taskId,
+                values: { transaction: params.toId },
+                options: { ignoreMandatoryFields: true }
+            });
+        } catch (subErr2) {
+            log.debug('Submit transaction note', subErr2.message);
+        }
+
+        // 3. Submit custom text TO reference fields if present
+        const toRefFields = ['custevent_to_number', 'custevent_fsm_to_number', 'custevent_transfer_order'];
+        for (let r = 0; r < toRefFields.length; r++) {
             try {
+                const updateObj = {};
+                updateObj[toRefFields[r]] = params.tranId;
                 record.submitFields({
                     type: record.Type.TASK,
                     id: taskId,
-                    values: {
-                        transaction: params.toId
-                    },
+                    values: updateObj,
                     options: { ignoreMandatoryFields: true }
                 });
-            } catch (subErr2) {
-                log.debug('Direct submitFields transaction fallback note', subErr2.message);
-            }
+            } catch (re) { }
         }
 
         log.debug('Task Created', `Task Record ID: ${taskId} created with Form ${params.formId} linked to Asset ID: ${params.assetId} for TO: ${params.toId}`);
