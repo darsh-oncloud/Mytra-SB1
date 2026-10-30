@@ -8,7 +8,7 @@
  *
  * Zendesk assets live under /api/v2/it_asset_management/ (NOT custom objects).
  */
-define(['N/https', 'N/log', 'N/runtime'], function (https, log, runtime) {
+define(['N/https', 'N/log'], function (https, log) {
 
     // =============================================
     // CONFIGURATION
@@ -17,14 +17,7 @@ define(['N/https', 'N/log', 'N/runtime'], function (https, log, runtime) {
     var ITAM = '/api/v2/it_asset_management';
     var CLIENT_ID = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
-    // Put the NEW (rotated) secret in a script parameter, not in code.
-    // Script record > Parameters > id: custscript_zd_client_secret (Password / Free-Form Text)
-    function getClientSecret() {
-        var s = runtime.getCurrentScript()
-            .getParameter({ name: 'custscript_zd_client_secret' });
-        if (!s) throw Error('Missing script parameter custscript_zd_client_secret');
-        return s;
-    }
+    var CLIENT_SECRET = 'PASTE_NEW_CLIENT_SECRET_HERE';
 
     // ---- STEP SWITCH ----
     var CREATE_ENABLED = false;   // false = read/log only, true = create
@@ -75,7 +68,7 @@ define(['N/https', 'N/log', 'N/runtime'], function (https, log, runtime) {
             body: JSON.stringify({
                 grant_type: 'client_credentials',
                 client_id: CLIENT_ID,
-                client_secret: getClientSecret(),
+                client_secret: CLIENT_SECRET,
                 scope: scope            // space-separated string, e.g. "read write"
             })
         });
