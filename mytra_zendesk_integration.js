@@ -15,9 +15,9 @@ define(['N/https', 'N/log'], function (https, log) {
     // =============================================
     var BASE_URL = 'https://mytra.zendesk.com';
     var ITAM = '/api/v2/it_asset_management';
-    var CLIENT_ID = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
+    var CLIENT_ID = 'netsuite_fsm_integration';
 
-    var CLIENT_SECRET = 'PASTE_NEW_CLIENT_SECRET_HERE';
+    var CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
     // ---- STEP SWITCH ----
     var CREATE_ENABLED = false;   // false = read/log only, true = create
