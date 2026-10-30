@@ -24,7 +24,7 @@ define(['N/https', 'N/log'], function (https, log) {
 
     // Leave null to auto-detect (first custom object with "asset" in key/title).
     // After Step 1, paste the exact key from the "ALL CUSTOM OBJECTS" log here.
-    var OBJECT_KEY = null;
+    var OBJECT_KEY = 'ezo_cmms_assets';
 
     var ORGANIZATION_ID = 55112815315988;   // Baxter Healthcare Corporation
 
@@ -37,16 +37,21 @@ define(['N/https', 'N/log'], function (https, log) {
     // After Step 1, replace the LEFT side with the real field keys from the
     // "ASSET OBJECT FIELDS" log. Fields whose key doesn't exist on the
     // object are skipped automatically, so it's safe to run as-is.
+    // Mapped to the real fields of ezo_cmms_assets (from the Step 1 log).
+    // This object has no lease / warranty / organization fields,
+    // so those details go into "description".
     var FIELD_VALUES = {
-        serial_number: 'MYT-00067-00-00004',
-        item: 'MYT-00067-00 P1 BOT ASM',
-        status: 'On Lease',
-        lease_start: '2026-10-01',
-        lease_end: '2027-05-31',
-        under_warranty: true,
-        warranty_start: '2026-10-01',
-        warranty_end: '2028-04-01',
-        organization: ORGANIZATION_ID      // lookup field to the organization
+        asset_name: 'MYT-00067-00 P1 BOT ASM MYT-00067-00-00004',
+        identifier: 'MYT-00067-00-00004',               // serial number
+        product_model_number: 'MYT-00067-00 P1 BOT ASM', // NetSuite item
+        state: 'On Lease',                               // NetSuite status
+        assigned_to: 'Baxter Healthcare Corporation',    // customer
+        quantity: 1,
+        description:
+            'NetSuite Asset ID: 224. ' +
+            'Customer: Baxter Healthcare Corporation (Zendesk Org ' + ORGANIZATION_ID + '). ' +
+            'Lease: 2026-10-01 to 2027-05-31. ' +
+            'Warranty: 2026-10-01 to 2028-04-01 (under warranty).'
     };
 
     // =============================================
@@ -230,12 +235,17 @@ define(['N/https', 'N/log'], function (https, log) {
         if ((r.code === 201 || r.code === 200) && rec && rec.id) {
             log.audit('ZENDESK ASSET CREATED', {
                 zendeskRecordId: rec.id,
-                netsuiteAssetId: ASSET.external_id,
-                name: rec.name
+                netsuiteAssetId: rec.external_id,
+                name: rec.name,
+                createdAt: rec.created_at,
+                url: rec.url
             });
+            // Everything Zendesk saved, including all field values
+            logData('CREATED RECORD FULL RESPONSE', r.data);
             return rec.id;
         }
         log.error('ASSET CREATION FAILED', { code: r.code });
+        logData('CREATE FAILED RESPONSE', r.data);
         return null;
     }
 
