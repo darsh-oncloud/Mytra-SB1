@@ -4,14 +4,13 @@
  */
 define(['N/https', 'N/log'], function(https, log) {
 
-    // ================================================
-    // ZENDESK CONFIGURATION
-    // ================================================
+    // =============================================
+    // CONFIGURATION
+    // =============================================
     var BASE_URL = 'https://mytra.zendesk.com';
     var CLIENT_ID = 'netsuite_fsm_integration';
     var CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
-    // First test false, then change to true.
     var CREATE_ENABLED = false;
 
     var ASSET_TYPE_ID = '01M66KSY9W5XGPN4BJVST123JK';
@@ -23,15 +22,15 @@ define(['N/https', 'N/log'], function(https, log) {
         serial_number: 'MYT-00067-00-00004',
         model: 'MYT-00067-00 P1 BOT ASM',
         warranty_expiration: '2028-04-01',
-        notes: 'NetSuite Field Service Asset ID: 224. ' +
-               'NetSuite Status: On Lease. ' +
+        notes: 'NetSuite Asset ID: 224. ' +
+               'Status: On Lease. ' +
                'Lease Start: 2026-10-01. ' +
                'Lease End: 2027-05-31.'
     };
 
-    // ================================================
-    // LOG COMPLETE JSON IN PARTS
-    // ================================================
+    // =============================================
+    // LOG JSON IN PARTS
+    // =============================================
     function logData(title, data) {
 
         var value = JSON.stringify(data, null, 2) || 'null';
@@ -39,7 +38,6 @@ define(['N/https', 'N/log'], function(https, log) {
         var total = Math.ceil(value.length / size);
 
         for (var i = 0; i < total; i++) {
-
             log.audit(
                 title + ' PART ' + (i + 1) + '/' + total,
                 value.substring(i * size, (i + 1) * size)
@@ -47,12 +45,12 @@ define(['N/https', 'N/log'], function(https, log) {
         }
     }
 
-    // ================================================
+    // =============================================
     // OAUTH TOKEN
-    // ================================================
+    // =============================================
     function getToken(scope) {
 
-        var response = https.post({
+        var res = https.post({
             url: BASE_URL + '/oauth/tokens',
             headers: {
                 'Content-Type': 'application/json',
@@ -66,44 +64,51 @@ define(['N/https', 'N/log'], function(https, log) {
             })
         });
 
-        if (Number(response.code) !== 200) {
+        var data = {};
+
+        try {
+            data = JSON.parse(res.body);
+        } catch (e) {
+            data = {raw: res.body};
+        }
+
+        if (Number(res.code) !== 200 ||
+            !data.access_token) {
 
             log.error('OAUTH FAILED', {
-                scope: scope,
-                code: response.code,
-                body: response.body
+                requestedScope: scope,
+                httpCode: res.code,
+                error: data.error,
+                description: data.error_description
             });
 
             return null;
         }
 
-        var data = JSON.parse(response.body);
-
         log.audit('OAUTH SUCCESS', {
             requestedScope: scope,
-            grantedScope: data.scope,
-            hasToken: !!data.access_token
+            grantedScope: data.scope
         });
 
-        return data.access_token || null;
+        return data.access_token;
     }
 
-    // ================================================
-    // GENERIC GET API
-    // ================================================
+    // =============================================
+    // GENERIC GET
+    // =============================================
     function getAPI(token, endpoint) {
 
         var url = endpoint.indexOf('https://') === 0
             ? endpoint
             : BASE_URL + endpoint;
 
-        if (url.indexOf(BASE_URL +
-            '/api/v2/it_asset_management/') !== 0) {
-
-            throw Error('Unexpected Zendesk API URL');
+        if (url.indexOf(
+            BASE_URL + '/api/v2/it_asset_management/'
+        ) !== 0) {
+            throw Error('Unexpected Zendesk URL');
         }
 
-        var response = https.get({
+        var res = https.get({
             url: url,
             headers: {
                 Authorization: 'Bearer ' + token,
@@ -111,67 +116,63 @@ define(['N/https', 'N/log'], function(https, log) {
             }
         });
 
-        var data;
+        var data = {};
 
         try {
-            data = JSON.parse(response.body);
+            data = JSON.parse(res.body);
         } catch (e) {
-            data = { raw: response.body };
+            data = {raw: res.body};
         }
 
-        log.audit('GET API RESPONSE', {
+        log.audit('API GET RESULT', {
             endpoint: endpoint,
-            httpCode: response.code
+            httpCode: res.code
         });
 
-        if (Number(response.code) !== 200) {
-
-            log.error('GET API FAILED', {
+        if (Number(res.code) !== 200) {
+            logData('API GET ERROR', {
                 endpoint: endpoint,
-                code: response.code,
+                code: res.code,
                 response: data
             });
         }
 
         return {
-            code: Number(response.code),
+            code: Number(res.code),
             data: data
         };
     }
 
-    // ================================================
-    // GET ALL EXISTING ASSETS
-    // ================================================
-    function getExistingAssets(token) {
+    // =============================================
+    // GET EXISTING ASSETS
+    // =============================================
+    function getAssets(token) {
 
-        var endpoint =
-            '/api/v2/it_asset_management/assets?page[size]=50';
+        var next =
+            '/api/v2/it_asset_management/assets' +
+            '?page[size]=100';
 
-        var page = 0;
         var count = 0;
+        var pages = 0;
         var found = false;
-        var completed = false;
 
-        while (endpoint && page < 50) {
+        while (next && pages < 100) {
 
-            page++;
+            pages++;
 
-            var result = getAPI(token, endpoint);
+            var result = getAPI(token, next);
 
             if (result.code !== 200) {
-                return {
-                    success: false,
-                    count: count,
-                    exists: found
-                };
-            }
-
-            var rows = result.data.assets || [];
-
-            if (!Array.isArray(rows)) {
-                log.error('INVALID ASSET RESPONSE', result.data);
                 return {success: false};
             }
+
+            if (!Array.isArray(result.data.assets)) {
+                log.error('INVALID ASSET RESPONSE',
+                    result.data);
+                return {success: false};
+            }
+
+            var rows = result.data.assets;
 
             for (var i = 0; i < rows.length; i++) {
 
@@ -179,82 +180,69 @@ define(['N/https', 'N/log'], function(https, log) {
 
                 var asset = rows[i];
 
-                logData('EXISTING ZENDESK ASSET ' + count,
-                    asset);
+                logData(
+                    'EXISTING ASSET ' + count,
+                    asset
+                );
 
                 if (
                     String(asset.external_id || '') ===
                         ASSET.external_id ||
-                    (
-                        asset.serial_number &&
-                        asset.serial_number ===
-                            ASSET.serial_number
-                    )
+                    asset.serial_number ===
+                        ASSET.serial_number
                 ) {
-
                     found = true;
 
                     log.audit('MATCHING ASSET FOUND', {
                         zendeskAssetId: asset.id,
-                        name: asset.name,
                         externalId: asset.external_id,
-                        serialNumber: asset.serial_number
+                        name: asset.name,
+                        serial: asset.serial_number
                     });
                 }
             }
 
-            log.audit('ASSET PAGE RETRIEVED', {
-                page: page,
-                countOnPage: rows.length,
-                totalRetrieved: count
+            log.audit('ASSET PAGE', {
+                page: pages,
+                records: rows.length,
+                total: count
             });
 
-            var next = result.data.links &&
-                result.data.links.next;
+            var meta = result.data.meta || {};
+            var links = result.data.links || {};
 
-            if (next) {
+            if (meta.has_more) {
 
-                endpoint = next;
-
-            } else if (
-                result.data.meta &&
-                result.data.meta.has_more
-            ) {
-
-                var cursor =
-                    result.data.meta.after_cursor;
-
-                if (!cursor) {
-                    log.error('ASSET PAGINATION ERROR',
-                        'Missing next cursor');
+                if (links.next) {
+                    next = links.next;
+                } else if (meta.after_cursor) {
+                    next =
+                        '/api/v2/it_asset_management/assets' +
+                        '?page[size]=100&page[after]=' +
+                        encodeURIComponent(
+                            meta.after_cursor
+                        );
+                } else {
+                    log.error('PAGINATION ERROR',
+                        'Missing asset next cursor');
                     return {success: false};
                 }
 
-                endpoint =
-                    '/api/v2/it_asset_management/assets' +
-                    '?page[size]=50&page[after]=' +
-                    encodeURIComponent(cursor);
-
             } else {
-
-                endpoint = null;
-                completed = true;
+                next = null;
             }
         }
 
-        if (!completed) {
-
-            log.error('ASSET LIST INCOMPLETE', {
-                pageLimit: 50,
-                totalRetrieved: count
-            });
+        if (next) {
+            log.error('ASSET LIST INCOMPLETE',
+                'Pagination limit reached');
 
             return {success: false};
         }
 
         log.audit('ALL ASSETS RETRIEVED', {
-            totalAssets: count,
-            pages: page,
+            total: count,
+            pages: pages,
             matchingAssetExists: found
         });
 
@@ -265,9 +253,9 @@ define(['N/https', 'N/log'], function(https, log) {
         };
     }
 
-    // ================================================
+    // =============================================
     // GET ASSET TYPES
-    // ================================================
+    // =============================================
     function getAssetTypes(token) {
 
         var result = getAPI(
@@ -282,33 +270,31 @@ define(['N/https', 'N/log'], function(https, log) {
 
         for (var i = 0; i < rows.length; i++) {
 
-            logData('ZENDESK ASSET TYPE ' + (i + 1),
-                rows[i]);
+            logData('ASSET TYPE ' + (i + 1), rows[i]);
 
             if (String(rows[i].id) === ASSET_TYPE_ID) {
                 found = true;
-                log.audit('BOT ASSET TYPE CONFIRMED', rows[i]);
             }
         }
 
-        log.audit('ASSET TYPES TOTAL', {
-            count: rows.length,
-            botTypeFound: found
+        log.audit('BOT ASSET TYPE CHECK', {
+            assetTypeId: ASSET_TYPE_ID,
+            found: found
         });
 
         return found;
     }
 
-    // ================================================
-    // GET BOT ASSET FIELDS
-    // ================================================
+    // =============================================
+    // GET ASSET FIELDS
+    // =============================================
     function getAssetFields(token) {
 
-        var endpoint =
+        var result = getAPI(
+            token,
             '/api/v2/it_asset_management/asset_types/' +
-            ASSET_TYPE_ID + '/fields';
-
-        var result = getAPI(token, endpoint);
+            ASSET_TYPE_ID + '/fields'
+        );
 
         if (result.code !== 200) return false;
 
@@ -318,10 +304,10 @@ define(['N/https', 'N/log'], function(https, log) {
         return true;
     }
 
-    // ================================================
-    // GET AVAILABLE ASSET STATUSES
-    // ================================================
-    function getStatusId(token) {
+    // =============================================
+    // GET ASSET STATUSES
+    // =============================================
+    function getStatuses(token) {
 
         var result = getAPI(
             token,
@@ -330,71 +316,43 @@ define(['N/https', 'N/log'], function(https, log) {
 
         if (result.code !== 200) return null;
 
-        var statuses = result.data.statuses || [];
+        var rows = result.data.statuses || [];
         var selected = null;
 
-        for (var i = 0; i < statuses.length; i++) {
+        for (var i = 0; i < rows.length; i++) {
 
-            logData('ZENDESK ASSET STATUS ' + (i + 1),
-                statuses[i]);
+            logData(
+                'ASSET STATUS ' + (i + 1),
+                rows[i]
+            );
 
             if (
-                (statuses[i].name || '').toLowerCase() ===
-                'on lease'
+                String(rows[i].name || '')
+                    .toLowerCase() === 'on lease'
             ) {
-                selected = statuses[i];
+                selected = rows[i];
             }
         }
 
-        // If exact "On Lease" is unavailable,
-        // select an existing In Use category status.
+        // Do not silently substitute an unrelated status.
         if (!selected) {
-
-            for (var j = 0; j < statuses.length; j++) {
-
-                if (
-                    (statuses[j].name || '').toLowerCase()
-                        === 'in use'
-                ) {
-                    selected = statuses[j];
-                    break;
-                }
-            }
-        }
-
-        if (!selected) {
-
-            for (var k = 0; k < statuses.length; k++) {
-
-                if (statuses[k].category === 'in_use') {
-                    selected = statuses[k];
-                    break;
-                }
-            }
-        }
-
-        if (!selected) {
-
-            log.error('NO SUITABLE STATUS FOUND', {
-                availableStatuses: statuses
-            });
+            log.error('ON LEASE STATUS NOT FOUND',
+                'Review available statuses and choose the correct mapping');
 
             return null;
         }
 
         log.audit('SELECTED ASSET STATUS', {
             id: selected.id,
-            name: selected.name,
-            category: selected.category,
-            netsuiteStatus: 'On Lease'
+            name: selected.name
         });
 
         return selected.id;
     }
 
-    // ================================================
-    // CREATE HARDCODED ZENDESK ASSET
-    // ================================================
+    // =============================================
+    // CREATE ASSET
+    // =============================================
     function createAsset(token, statusId) {
 
         var payload = {
@@ -403,8 +361,8 @@ define(['N/https', 'N/log'], function(https, log) {
                 asset_type_id: ASSET_TYPE_ID,
                 status_id: statusId,
                 organization_id: ORGANIZATION_ID,
-                serial_number: ASSET.serial_number,
                 external_id: ASSET.external_id,
+                serial_number: ASSET.serial_number,
                 model: ASSET.model,
                 warranty_expiration:
                     ASSET.warranty_expiration,
@@ -414,7 +372,7 @@ define(['N/https', 'N/log'], function(https, log) {
 
         logData('ASSET CREATE PAYLOAD', payload);
 
-        var response = https.post({
+        var res = https.post({
             url: BASE_URL +
                 '/api/v2/it_asset_management/assets',
             headers: {
@@ -425,121 +383,125 @@ define(['N/https', 'N/log'], function(https, log) {
             body: JSON.stringify(payload)
         });
 
-        var result;
+        var result = {};
 
         try {
-            result = JSON.parse(response.body);
+            result = JSON.parse(res.body);
         } catch (e) {
-            result = { raw: response.body };
+            result = {raw: res.body};
         }
 
-        logData('ASSET CREATION API RESPONSE', {
-            httpCode: response.code,
-            result: result
+        logData('ASSET CREATE RESPONSE', {
+            code: res.code,
+            data: result
         });
 
-        if (
-            Number(response.code) === 201 &&
-            result.asset &&
-            result.asset.id
-        ) {
+        if (Number(res.code) === 201 &&
+            result.asset && result.asset.id) {
 
             log.audit('ZENDESK ASSET CREATED', {
                 zendeskAssetId: result.asset.id,
                 netsuiteAssetId: ASSET.external_id,
-                assetName: result.asset.name,
                 organizationId: ORGANIZATION_ID,
-                statusId: statusId
+                name: result.asset.name
             });
 
         } else {
 
-            log.error('ZENDESK ASSET CREATION FAILED', {
-                code: response.code,
+            log.error('ASSET CREATION FAILED', {
+                code: res.code,
                 response: result
             });
         }
     }
 
-    // ================================================
+    // =============================================
     // MAP REDUCE
-    // ================================================
+    // =============================================
     function getInputData() {
-        return [{ id: 224 }];
+        return [{id: 224}];
     }
 
     function map(context) {
 
         try {
 
-            log.audit('ZENDESK ASSET TEST STARTED', {
-                assetId: ASSET.external_id,
+            log.audit('ASSET TEST STARTED', {
                 createEnabled: CREATE_ENABLED,
-                assetTypeId: ASSET_TYPE_ID,
-                organizationId: ORGANIZATION_ID
+                assetId: ASSET.external_id,
+                organizationId: ORGANIZATION_ID,
+                assetTypeId: ASSET_TYPE_ID
             });
 
-            // READ EXISTING ZENDESK DATA
             var readToken = getToken('read');
 
             if (!readToken) {
-                log.error('TEST STOPPED',
-                    'Unable to obtain Zendesk read token');
-                return;
-            }
 
-            var existing = getExistingAssets(readToken);
-
-            if (!existing.success) {
-                log.error('TEST STOPPED',
-                    'Existing assets could not be fully checked');
-                return;
-            }
-
-            var typeFound = getAssetTypes(readToken);
-
-            var fieldsOK = getAssetFields(readToken);
-
-            var statusId = getStatusId(readToken);
-
-            // READ-ONLY TEST MODE
-            if (!CREATE_ENABLED) {
-
-                log.audit('READ ONLY TEST FINISHED', {
-                    existingAssetCount: existing.count,
-                    matchingAssetExists: existing.exists,
-                    botAssetTypeFound: typeFound,
-                    assetFieldsRead: fieldsOK,
-                    selectedStatusId: statusId,
-                    creationAttempted: false
+                log.error('ASSET TEST BLOCKED', {
+                    reason: 'OAuth read scope unavailable',
+                    nextStep:
+                        'Authorize read scope on Zendesk OAuth client',
+                    assetCreationAttempted: false
                 });
 
                 return;
             }
 
-            // PREVENT DUPLICATE CREATION
+            var existing = getAssets(readToken);
+
+            if (!existing.success) {
+                log.error('TEST STOPPED',
+                    'Could not retrieve all existing assets');
+                return;
+            }
+
+            var typeFound = getAssetTypes(readToken);
+            var fieldsFound = getAssetFields(readToken);
+            var statusId = getStatuses(readToken);
+
+            log.audit('ASSET DIAGNOSTIC SUMMARY', {
+                existingAssets: existing.count,
+                matchingAssetExists: existing.exists,
+                botAssetTypeFound: typeFound,
+                botFieldsRetrieved: fieldsFound,
+                statusId: statusId,
+                createEnabled: CREATE_ENABLED
+            });
+
+            if (!CREATE_ENABLED) {
+
+                log.audit('READ ONLY TEST COMPLETED',
+                    'No Zendesk records changed');
+
+                return;
+            }
+
             if (existing.exists) {
+
                 log.audit('ASSET CREATION SKIPPED',
-                    'Matching asset already exists');
+                    'Matching external ID or serial already exists');
+
                 return;
             }
 
-            if (!typeFound || !fieldsOK || !statusId) {
+            if (!typeFound || !fieldsFound || !statusId) {
+
                 log.error('ASSET CREATION SKIPPED',
-                    'Asset type, fields or status unavailable');
+                    'Required configuration missing');
+
                 return;
             }
 
-            // WRITE TOKEN
             var writeToken = getToken('write');
 
             if (!writeToken) {
-                log.error('TEST STOPPED',
-                    'Unable to obtain Zendesk write token');
+
+                log.error('CREATE BLOCKED',
+                    'Zendesk write scope not granted');
+
                 return;
             }
 
-            // CREATE ONE TEST ASSET
             createAsset(writeToken, statusId);
 
         } catch (e) {
