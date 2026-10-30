@@ -2,11 +2,12 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  *
- * Zendesk IT Asset Management (ITAM) test
- *   STEP 1  (CREATE_ENABLED = false): read & log assets, asset types, statuses
- *   STEP 2  (CREATE_ENABLED = true) : create the hardcoded NetSuite asset
+ * Zendesk Asset as a CUSTOM OBJECT
+ *   STEP 1 (CREATE_ENABLED = false): find the Asset custom object, log its
+ *          fields and all existing asset records. Nothing is changed.
+ *   STEP 2 (CREATE_ENABLED = true) : create the hardcoded NetSuite asset record.
  *
- * Zendesk assets live under /api/v2/it_asset_management/ (NOT custom objects).
+ * Uses scopes your OAuth client already has: custom_objects:read / custom_objects:write
  */
 define(['N/https', 'N/log'], function (https, log) {
 
@@ -14,38 +15,38 @@ define(['N/https', 'N/log'], function (https, log) {
     // CONFIGURATION
     // =============================================
     var BASE_URL = 'https://mytra.zendesk.com';
-    var ITAM = '/api/v2/it_asset_management';
+    var CO = '/api/v2/custom_objects';
     var CLIENT_ID = 'netsuite_fsm_integration';
-
     var CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
     // ---- STEP SWITCH ----
     var CREATE_ENABLED = false;   // false = read/log only, true = create
 
-    var ASSET_TYPE_ID = '01M66KSY9W5XGPN4BJVST123JK';
-    var ORGANIZATION_ID = 55112815315988;
+    // Leave null to auto-detect (first custom object with "asset" in key/title).
+    // After Step 1, paste the exact key from the "ALL CUSTOM OBJECTS" log here.
+    var OBJECT_KEY = null;
 
-    // Leave null to auto-match a status named STATUS_NAME.
-    // After Step 1, you can paste the exact status id from the logs here.
-    var STATUS_ID = null;
-    var STATUS_NAME = 'on lease';
-
-    // Custom fields on your BOT asset type (fill in after Step 1).
-    // Replace the keys with the real field keys from the "ASSET TYPE FIELDS" log.
-    // Empty values are skipped, so it's safe to leave these blank for now.
-    var CUSTOM_FIELDS = {
-        // lease_start: '2026-10-01',
-        // lease_end: '2027-05-31'
-    };
+    var ORGANIZATION_ID = 55112815315988;   // Baxter Healthcare Corporation
 
     var ASSET = {
         name: 'MYT-00067-00 P1 BOT ASM MYT-00067-00-00004',
-        external_id: '224',
+        external_id: '224'          // NetSuite asset internal ID
+    };
+
+    // Field values for the asset record.
+    // After Step 1, replace the LEFT side with the real field keys from the
+    // "ASSET OBJECT FIELDS" log. Fields whose key doesn't exist on the
+    // object are skipped automatically, so it's safe to run as-is.
+    var FIELD_VALUES = {
         serial_number: 'MYT-00067-00-00004',
-        model: 'MYT-00067-00 P1 BOT ASM',
-        warranty_expiration: '2028-04-01',
-        notes: 'NetSuite Asset ID: 224. Status: On Lease. ' +
-               'Lease Start: 2026-10-01. Lease End: 2027-05-31.'
+        item: 'MYT-00067-00 P1 BOT ASM',
+        status: 'On Lease',
+        lease_start: '2026-10-01',
+        lease_end: '2027-05-31',
+        under_warranty: true,
+        warranty_start: '2026-10-01',
+        warranty_end: '2028-04-01',
+        organization: ORGANIZATION_ID      // lookup field to the organization
     };
 
     // =============================================
@@ -55,7 +56,6 @@ define(['N/https', 'N/log'], function (https, log) {
         try { return JSON.parse(body); } catch (e) { return { raw: body }; }
     }
 
-    // Logs long JSON in 3500-char chunks (NetSuite log detail limit ~3999)
     function logData(title, data) {
         var value = JSON.stringify(data, null, 2) || 'null';
         var size = 3500;
@@ -66,9 +66,6 @@ define(['N/https', 'N/log'], function (https, log) {
         }
     }
 
-    // =============================================
-    // OAUTH (client_credentials)
-    // =============================================
     function getToken(scope) {
         var res = https.post({
             url: BASE_URL + '/oauth/tokens',
@@ -77,11 +74,10 @@ define(['N/https', 'N/log'], function (https, log) {
                 grant_type: 'client_credentials',
                 client_id: CLIENT_ID,
                 client_secret: CLIENT_SECRET,
-                scope: scope            // space-separated string, e.g. "read write"
+                scope: scope
             })
         });
         var data = parse(res.body);
-
         if (Number(res.code) !== 200 || !data.access_token) {
             log.error('OAUTH FAILED', {
                 requestedScope: scope, httpCode: res.code,
@@ -93,13 +89,8 @@ define(['N/https', 'N/log'], function (https, log) {
         return data.access_token;
     }
 
-    // =============================================
-    // GENERIC REQUEST
-    // =============================================
     function call(token, method, endpoint, payload) {
         var url = endpoint.indexOf('https://') === 0 ? endpoint : BASE_URL + endpoint;
-        if (url.indexOf(BASE_URL + ITAM) !== 0) throw Error('Unexpected Zendesk URL: ' + url);
-
         var opts = {
             url: url,
             headers: {
@@ -116,155 +107,133 @@ define(['N/https', 'N/log'], function (https, log) {
 
         log.audit('API ' + method, { endpoint: endpoint, httpCode: code });
         if (code >= 400) logData('API ' + method + ' ERROR ' + code, { endpoint: endpoint, response: data });
-
         return { code: code, data: data };
     }
 
     // =============================================
-    // STEP 1a: LIST ALL ASSETS (cursor pagination)
+    // STEP 1a: LIST ALL CUSTOM OBJECTS, PICK THE ASSET ONE
     // =============================================
-    function getAssets(token) {
-        var next = ITAM + '/assets?page[size]=100';
+    function findAssetObject(token) {
+        var r = call(token, 'GET', CO);
+        if (r.code !== 200) return null;
+
+        var objects = r.data.custom_objects || [];
+        logData('ALL CUSTOM OBJECTS (' + objects.length + ')', objects.map(function (o) {
+            return { key: o.key, title: o.title, title_pluralized: o.title_pluralized };
+        }));
+
+        if (OBJECT_KEY) {
+            var exact = objects.filter(function (o) { return o.key === OBJECT_KEY; })[0];
+            if (!exact) { log.error('OBJECT KEY NOT FOUND', OBJECT_KEY); return null; }
+            return exact.key;
+        }
+
+        var hit = objects.filter(function (o) {
+            return ((o.key || '') + ' ' + (o.title || '')).toLowerCase().indexOf('asset') !== -1;
+        })[0];
+
+        if (!hit) {
+            log.error('ASSET OBJECT NOT FOUND',
+                'No object with "asset" in its key/title. Set OBJECT_KEY from the list above.');
+            return null;
+        }
+        log.audit('ASSET OBJECT SELECTED', { key: hit.key, title: hit.title });
+        return hit.key;
+    }
+
+    // =============================================
+    // STEP 1b: FIELDS OF THE ASSET OBJECT
+    // =============================================
+    function getFields(token, key) {
+        var r = call(token, 'GET', CO + '/' + encodeURIComponent(key) + '/fields');
+        if (r.code !== 200) return [];
+
+        var fields = r.data.custom_object_fields || [];
+        logData('ASSET OBJECT FIELDS (' + fields.length + ')', fields.map(function (f) {
+            return {
+                key: f.key, title: f.title, type: f.type,
+                required: f.required, active: f.active,
+                relationship_target_type: f.relationship_target_type,
+                options: (f.custom_field_options || []).map(function (o) {
+                    return { name: o.name, value: o.value };
+                })
+            };
+        }));
+        return fields;
+    }
+
+    // =============================================
+    // STEP 1c: ALL EXISTING ASSET RECORDS (cursor pagination)
+    // =============================================
+    function getRecords(token, key) {
+        var next = CO + '/' + encodeURIComponent(key) + '/records?page%5Bsize%5D=100';
         var all = [];
         var pages = 0;
-        var match = null;
 
         while (next && pages < 50) {
             pages++;
             var r = call(token, 'GET', next);
-            if (r.code !== 200 || !Array.isArray(r.data.assets)) return { success: false };
+            if (r.code !== 200) return { success: false };
 
-            r.data.assets.forEach(function (a) {
-                all.push(a);
-                if (String(a.external_id || '') === ASSET.external_id ||
-                    a.serial_number === ASSET.serial_number) {
-                    match = a;
-                }
-            });
+            (r.data.custom_object_records || []).forEach(function (rec) { all.push(rec); });
 
             var meta = r.data.meta || {};
             var links = r.data.links || {};
-            next = meta.has_more ? (links.next ||
-                (meta.after_cursor ? ITAM + '/assets?page[size]=100&page[after]=' +
-                    encodeURIComponent(meta.after_cursor) : null)) : null;
+            next = meta.has_more ? (links.next || null) : null;
         }
 
-        // Compact one-line-per-asset log, plus the full JSON of the first asset
-        // so you can see every field Zendesk returns.
-        logData('EXISTING ASSETS (' + all.length + ')', all.map(function (a) {
+        logData('EXISTING ASSET RECORDS (' + all.length + ')', all.map(function (rec) {
             return {
-                id: a.id, name: a.name, external_id: a.external_id,
-                serial_number: a.serial_number, asset_type_id: a.asset_type_id,
-                status_id: a.status_id, organization_id: a.organization_id
+                id: rec.id, name: rec.name, external_id: rec.external_id,
+                fields: rec.custom_object_fields
             };
         }));
-        if (all.length) logData('FIRST ASSET FULL JSON', all[0]);
+        if (all.length) logData('FIRST RECORD FULL JSON', all[0]);
 
+        var match = all.filter(function (rec) {
+            return String(rec.external_id || '') === ASSET.external_id;
+        })[0] || null;
         if (match) log.audit('MATCHING ASSET FOUND', { id: match.id, name: match.name });
 
         return { success: !next, count: all.length, existing: match };
     }
 
     // =============================================
-    // STEP 1b: ASSET TYPES
+    // STEP 2: CREATE THE ASSET RECORD
     // =============================================
-    function checkAssetType(token) {
-        var r = call(token, 'GET', ITAM + '/asset_types');
-        if (r.code !== 200) return false;
+    function createRecord(token, key, fields) {
+        var validKeys = {};
+        fields.forEach(function (f) { validKeys[f.key] = true; });
 
-        var types = r.data.asset_types || [];
-        logData('ASSET TYPES', types.map(function (t) {
-            return { id: t.id, name: t.name, parent_id: t.parent_id };
-        }));
-
-        var found = types.some(function (t) { return String(t.id) === ASSET_TYPE_ID; });
-        log.audit('ASSET TYPE CHECK', { assetTypeId: ASSET_TYPE_ID, found: found });
-        return found;
-    }
-
-    // Informational only — does NOT block creation if it fails
-    function logAssetFields(token) {
-        var r = call(token, 'GET', ITAM + '/asset_types/' + ASSET_TYPE_ID + '/fields');
-        if (r.code === 200) logData('ASSET TYPE FIELDS', r.data);
-    }
-
-    // =============================================
-    // STEP 1c: STATUSES
-    // =============================================
-    function resolveStatus(token) {
-        var r = call(token, 'GET', ITAM + '/statuses');
-        if (r.code !== 200) return STATUS_ID;
-
-        var statuses = r.data.statuses || [];
-        logData('ASSET STATUSES', statuses.map(function (s) {
-            return { id: s.id, name: s.name };
-        }));
-
-        if (STATUS_ID) return STATUS_ID;
-
-        var hit = statuses.filter(function (s) {
-            return String(s.name || '').toLowerCase() === STATUS_NAME;
-        })[0];
-
-        if (!hit) {
-            log.error('STATUS NOT FOUND',
-                'No status named "' + STATUS_NAME + '". Pick an id from ASSET STATUSES and set STATUS_ID.');
-            return null;
+        var values = {};
+        var skipped = [];
+        Object.keys(FIELD_VALUES).forEach(function (k) {
+            if (validKeys[k]) values[k] = FIELD_VALUES[k];
+            else skipped.push(k);
+        });
+        if (skipped.length) {
+            log.audit('FIELDS SKIPPED (key not on object)', skipped.join(', '));
         }
-        return hit.id;
-    }
 
-    // =============================================
-    // STEP 1d: DIRECT LOOKUP BY NETSUITE ID
-    // GET /assets?filter[external_ids]=224  (official docs)
-    // =============================================
-    function findByExternalId(token, externalId) {
-        var r = call(token, 'GET', ITAM + '/assets?filter%5Bexternal_ids%5D=' +
-            encodeURIComponent(externalId));
-        if (r.code !== 200 || !Array.isArray(r.data.assets)) return { success: false };
-
-        var hit = r.data.assets[0] || null;
-        log.audit('LOOKUP BY EXTERNAL ID ' + externalId,
-            hit ? { found: true, id: hit.id, name: hit.name } : { found: false });
-        return { success: true, asset: hit };
-    }
-
-    // =============================================
-    // STEP 2: CREATE ASSET
-    // =============================================
-    function createAsset(token, statusId) {
         var payload = {
-            asset: {
-                name: ASSET.name,                 // required
-                asset_type_id: ASSET_TYPE_ID,     // required
-                status_id: statusId,              // required
-                organization_id: ORGANIZATION_ID,
+            custom_object_record: {
+                name: ASSET.name,
                 external_id: ASSET.external_id,
-                serial_number: ASSET.serial_number,
-                model: ASSET.model,
-                warranty_expiration: ASSET.warranty_expiration,
-                notes: ASSET.notes
+                custom_object_fields: values
             }
         };
-
-        // Custom fields of the asset type go in custom_field_values,
-        // using the field KEYS shown in the ASSET TYPE FIELDS log.
-        var custom = {};
-        Object.keys(CUSTOM_FIELDS).forEach(function (k) {
-            if (CUSTOM_FIELDS[k] !== null && CUSTOM_FIELDS[k] !== '') custom[k] = CUSTOM_FIELDS[k];
-        });
-        if (Object.keys(custom).length) payload.asset.custom_field_values = custom;
         logData('ASSET CREATE PAYLOAD', payload);
 
-        var r = call(token, 'POST', ITAM + '/assets', payload);
+        var r = call(token, 'POST', CO + '/' + encodeURIComponent(key) + '/records', payload);
+        var rec = r.data.custom_object_record;
 
-        if ((r.code === 201 || r.code === 200) && r.data.asset && r.data.asset.id) {
+        if ((r.code === 201 || r.code === 200) && rec && rec.id) {
             log.audit('ZENDESK ASSET CREATED', {
-                zendeskAssetId: r.data.asset.id,
+                zendeskRecordId: rec.id,
                 netsuiteAssetId: ASSET.external_id,
-                name: r.data.asset.name
+                name: rec.name
             });
-            return r.data.asset.id;     // save this back to NetSuite later
+            return rec.id;
         }
         log.error('ASSET CREATION FAILED', { code: r.code });
         return null;
@@ -278,46 +247,40 @@ define(['N/https', 'N/log'], function (https, log) {
     function map(context) {
         log.audit('ASSET TEST STARTED', { createEnabled: CREATE_ENABLED });
 
-        // One token for both steps. Falls back to read-only if write isn't allowed.
-        var token = getToken(CREATE_ENABLED ? 'read write' : 'read');
+        var token = getToken(CREATE_ENABLED
+            ? 'custom_objects:read custom_objects:write'
+            : 'custom_objects:read');
         if (!token) return;
 
         // ---------- STEP 1 ----------
-        var assets = getAssets(token);
-        if (!assets.success) { log.error('STOPPED', 'Could not list assets'); return; }
+        var key = findAssetObject(token);
+        if (!key) return;
 
-        var typeOk = checkAssetType(token);
-        logAssetFields(token);
-        var statusId = resolveStatus(token);
+        var fields = getFields(token, key);
+        var records = getRecords(token, key);
+        if (!records.success) { log.error('STOPPED', 'Could not list asset records'); return; }
 
         log.audit('DIAGNOSTIC SUMMARY', {
-            existingAssets: assets.count,
-            alreadyExists: !!assets.existing,
-            assetTypeFound: typeOk,
-            statusId: statusId
+            objectKey: key,
+            fieldCount: fields.length,
+            existingRecords: records.count,
+            alreadyExists: !!records.existing
         });
 
         if (!CREATE_ENABLED) { log.audit('READ ONLY DONE', 'No Zendesk records changed'); return; }
 
         // ---------- STEP 2 ----------
-        // Exact check by NetSuite ID right before creating (avoids duplicates)
-        var lookup = findByExternalId(token, ASSET.external_id);
-        if (!lookup.success) { log.error('CREATE SKIPPED', 'External ID lookup failed'); return; }
-        if (lookup.asset || assets.existing) {
-            log.audit('CREATE SKIPPED', 'Asset already exists: ' +
-                (lookup.asset || assets.existing).id);
+        if (records.existing) {
+            log.audit('CREATE SKIPPED', 'Asset already exists: ' + records.existing.id);
             return;
         }
-        if (!typeOk)   { log.error('CREATE SKIPPED', 'Asset type id not found'); return; }
-        if (!statusId) { log.error('CREATE SKIPPED', 'No status id'); return; }
-
-        createAsset(token, statusId);
+        createRecord(token, key, fields);
     }
 
     function summarize(summary) {
         if (summary.inputSummary.error) log.error('INPUT ERROR', summary.inputSummary.error);
-        summary.mapSummary.errors.iterator().each(function (key, err) {
-            log.error('MAP ERROR ' + key, err);
+        summary.mapSummary.errors.iterator().each(function (k, err) {
+            log.error('MAP ERROR ' + k, err);
             return true;
         });
         log.audit('ASSET TEST FINISHED', { usage: summary.usage, seconds: summary.seconds });
