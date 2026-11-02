@@ -20,7 +20,7 @@ define(['N/https', 'N/log'], function (https, log) {
     var CLIENT_SECRET = '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779';
 
     // ---- STEP SWITCH ----
-    var CREATE_ENABLED = false;   // false = read/log only, true = create
+    var CREATE_ENABLED = true;   // false = read/log only, true = create
 
     // Leave null to auto-detect (first custom object with "asset" in key/title).
     // After Step 1, paste the exact key from the "ALL CUSTOM OBJECTS" log here.
