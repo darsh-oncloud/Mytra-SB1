@@ -255,7 +255,7 @@ function (https, record, search, runtime, format, log) {
     // AFTER SUBMIT
     // =====================================================
     function afterSubmit(context) {
-        if (context.type !== context.UserEventType.CREATE) return;
+        if (context.type !== context.UserEventType.EDIT) return;
 
         var assetId = context.newRecord.id;
         var assetType = context.newRecord.type;
