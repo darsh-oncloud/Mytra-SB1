@@ -68,7 +68,7 @@ function (https, record, search, runtime, format, log) {
     // 2. NETSUITE FIELD IDS  (update these)
     // =====================================================
     var CUST = {
-        zdOrgId: 'custentity_zendesk_org_id'          // create this field
+        zdOrgId: 'custentity_organization_id'          // create this field
     };
 
     var ASSET = {
