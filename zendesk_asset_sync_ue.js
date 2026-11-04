@@ -27,14 +27,33 @@ function (https, record, search, runtime, format, log) {
         CLIENT_ID: 'netsuite_fsm_integration',
         // Preferred: store the secret in a script parameter (Password type)
         SECRET_PARAM: 'custscript_zd_client_secret',
-        CLIENT_SECRET_FALLBACK: 'PASTE_ROTATED_SECRET_HERE',
+        CLIENT_SECRET_FALLBACK: '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779',
         SCOPE: 'read write',
 
-        // Confirmed from your logs: "Bot" asset type
-        ASSET_TYPE_ID: '01M66KSY9W5XGPN4BJVST123JK',
+        // NetSuite Asset Type (custrecord_nx_asset_type) internal ID
+        //   -> Zendesk asset_type_id
+        // Only types listed here are sent to Zendesk; others are skipped.
+        //   4 = Bot, 3 = Component, 2 = Machine, 1 = Site
+        ASSET_TYPE_MAP: {
+            '4': '01M66KSY9W5XGPN4BJVST123JK'   // Bot (confirmed in your logs)
+        },
 
         // Used only when the NetSuite Asset Status is blank ("Available")
         DEFAULT_STATUS_ID: '01KKM6AZ63CRKT2TPZJSHJ5E7W',
+
+        // NetSuite status (custrecord_asset_statuses text) -> Zendesk status ID.
+        // Used when the names don't match exactly. If you rename the Zendesk
+        // statuses to match NetSuite, the name match wins and this is ignored.
+        // Zendesk: Available / In use / Under repair / On hold / Missing / Retired
+        STATUS_MAP: {
+            'available':         '01KKM6AZ63CRKT2TPZJSHJ5E7W', // Available
+            'operational':       '01KKM6AZ7N68ESYBWFGAS9T98R', // In use
+            'in transit':        '01KKM6AZDZMGVVH3DRAVD3AANN', // On hold
+            'under inspection':  '01KKM6AZDZMGVVH3DRAVD3AANN', // On hold
+            'in repair':         '01KKM6AZ9A0D10FKS5VY5HPMFG', // Under repair
+            'under maintenance': '01KKM6AZ9A0D10FKS5VY5HPMFG', // Under repair
+            'decommissioned':    '01KKM6AZFMN4ZZ61A36KCY86E2'  // Retired
+        },
 
         DEFAULT_MANUFACTURER: 'Mytra',
 
@@ -53,14 +72,15 @@ function (https, record, search, runtime, format, log) {
     };
 
     var ASSET = {
-        zdAssetId:      'custrecord_zendesk_asset_id', // create this field
+        zdAssetId:      'custrecord_asset_id',            // Zendesk Asset ID (written back)
         name:           'name',
-        customer:       'custrecord_nx_asset_customer', // verify
-        item:           'custrecord_nx_asset_item',     // verify
-        serial:         'custrecord_nx_asset_serial',   // verify
-        status:         'REPLACE_ASSET_STATUS_FIELD_ID',
-        contractStatus: 'REPLACE_CONTRACT_STATUS_FIELD_ID',
-        warrantyEnd:    'REPLACE_WARRANTY_END_FIELD_ID'
+        customer:       'custrecord_nx_asset_customer',
+        item:           'custrecord_nx_asset_item',
+        serial:         'custrecord_nx_asset_serial',
+        assetType:      'custrecord_nx_asset_type',       // Bot / Component / Machine / Site
+        status:         'custrecord_asset_statuses',      // Available, Operational, ...
+        contractStatus: 'custrecord_asset_status',        // Direct Sold / On Lease
+        warrantyEnd:    'custrecord_warranty_end_date'
     };
 
     // =====================================================
@@ -224,6 +244,9 @@ function (https, record, search, runtime, format, log) {
             }
         }
 
+        var mapped = ZD.STATUS_MAP[String(nsStatusText).trim().toLowerCase()];
+        if (mapped) return mapped;
+
         throw Error('No Zendesk status matches NetSuite status "' + nsStatusText +
             '". Available: ' + list.map(function (s) { return s.name; }).join(', '));
     }
@@ -251,7 +274,19 @@ function (https, record, search, runtime, format, log) {
                 return;
             }
 
+            var nsTypeId = String(val(a, ASSET.assetType) || '');
+            var zdTypeId = ZD.ASSET_TYPE_MAP[nsTypeId];
+
+            if (!zdTypeId) {
+                log.audit('Skipped: Asset Type not mapped to Zendesk', {
+                    netsuiteAssetId: assetId,
+                    assetType: txt(a, ASSET.assetType) || '(blank)'
+                });
+                return;
+            }
+
             var d = {
+                assetType:      txt(a, ASSET.assetType),
                 name:           txt(a, ASSET.name),
                 customerId:     val(a, ASSET.customer),
                 model:          txt(a, ASSET.item),
@@ -275,7 +310,7 @@ function (https, record, search, runtime, format, log) {
             var asset = {
                 name: d.name,
                 external_id: 'NS-ASSET-' + assetId,
-                asset_type_id: ZD.ASSET_TYPE_ID,
+                asset_type_id: zdTypeId,
                 status_id: statusId,
                 organization_id: Number(orgId),
                 manufacturer: ZD.DEFAULT_MANUFACTURER
