@@ -33,7 +33,7 @@ function (https, runtime, log) {
         BASE_URL: 'https://mytra.zendesk.com',
         CLIENT_ID: 'netsuite_fsm_integration',
         SECRET_PARAM: 'custscript_zd_client_secret',
-        CLIENT_SECRET_FALLBACK: 'PASTE_ROTATED_SECRET_HERE',
+        CLIENT_SECRET_FALLBACK: '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779',
         SCOPE: 'read write',
 
         OBJECT_KEY: 'assembly_item',
