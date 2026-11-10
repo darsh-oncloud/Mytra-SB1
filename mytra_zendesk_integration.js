@@ -3,323 +3,591 @@
  * @NScriptType MapReduceScript
  * @NModuleScope SameAccount
  *
- * FIELD DISCOVERY (READ-ONLY) - NetSuite <-> Zendesk
+ * Field Service Asset -> Zendesk  (CREATE ONLY)
  *
- * Creates NOTHING in Zendesk and changes NOTHING in NetSuite.
- * It only reads field definitions and sample values, then:
- *   1. writes one CSV to the File Cabinet (FOLDER_ID)   -> open it in Excel
- *   2. logs every section as Audit lines (Execution Log)
+ * PARENT asset (Parent field empty, Asset Type mapped e.g. Bot)
+ *   1. Customer has Zendesk Org ID?  yes -> use it | no -> create Org (+address), save ID on Customer
+ *   2. Create Zendesk ITAM Asset under that Org
+ *   3. Save Zendesk Asset ID on the NetSuite asset
  *
- * Sections:
- *   ZD_ORG      Zendesk Organization fields          -> search label org. / org_cf.
- *   ZD_ASSET    Zendesk ITAM Asset fields per type   -> search label asset. / asset_cf.
- *   ZD_ASM      Zendesk assembly_item fields         -> search label asm.
- *   NS_ASSET    NetSuite Field Service Asset fields (child + parent values)
- *   NS_CUSTOMER NetSuite Customer fields (join CUSTRECORD_NX_ASSET_CUSTOMER)
+ * CHILD asset (Parent field populated)
+ *   1. Parent has Zendesk Asset ID?  yes -> use it
+ *                                    no  -> create Org (if needed) + Parent asset first, save ID on parent
+ *   2. Create "assembly_item" custom object record with bot_parent = parent Zendesk Asset ID
+ *   3. Save the assembly_item record ID on the child NetSuite asset
  *
- * No script parameters: set the constants below.
+ * Why grouped: every child is grouped with its parent (reduce key = parent ID),
+ * so a parent is created once even when many children are processed together.
+ *
+ * INPUT = your SAVED SEARCH. Columns are read by their CUSTOM LABEL
+ * (see SEARCH_LABELS below), so column order does not matter.
+ *
+ * No script parameters: set CLIENT_SECRET, SEARCH_ID and TEST_ASSET_ID below.
  */
-define(['N/https', 'N/record', 'N/file', 'N/log'],
-function (https, record, file, log) {
+define(['N/https', 'N/record', 'N/search', 'N/runtime', 'N/format', 'N/log'],
+function (https, record, search, runtime, format, log) {
 
     // =====================================================
-    // CONFIG
+    // 1. ZENDESK CONFIG
     // =====================================================
     var ZD = {
         BASE_URL: 'https://mytra.zendesk.com',
         CLIENT_ID: 'netsuite_fsm_integration',
         CLIENT_SECRET: '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779',
-        SCOPE: 'read',
-        CHILD_OBJECT_KEY: 'assembly_item'
+        SCOPE: 'read write',
+
+        // Asset type is matched BY NAME: NetSuite Asset Type text -> Zendesk asset type
+        // with the same name (read live from Zendesk, no IDs hardcoded).
+        // Children are always children of a Bot, so if a parent has to be created
+        // and its type is blank / has no Zendesk match, this Zendesk type name is used:
+        PARENT_TYPE_NAME: 'Bot',
+
+        DEFAULT_STATUS_ID: '01KKM6AZ63CRKT2TPZJSHJ5E7W',     // Available
+        STATUS_MAP: {
+            'available':         '01KKM6AZ63CRKT2TPZJSHJ5E7W', // Available
+            'operational':       '01KKM6AZ7N68ESYBWFGAS9T98R', // In use
+            'in transit':        '01KKM6AZDZMGVVH3DRAVD3AANN', // On hold
+            'under inspection':  '01KKM6AZDZMGVVH3DRAVD3AANN', // On hold
+            'in repair':         '01KKM6AZ9A0D10FKS5VY5HPMFG', // Under repair
+            'under maintenance': '01KKM6AZ9A0D10FKS5VY5HPMFG', // Under repair
+            'decommissioned':    '01KKM6AZFMN4ZZ61A36KCY86E2'  // Retired
+        },
+
+        DEFAULT_MANUFACTURER: 'Mytra',
+        CONTRACT_STATUS_KEY: '',          // no Zendesk field yet -> not sent
+
+        CHILD_OBJECT_KEY: 'assembly_item' // Zendesk custom object for children
     };
 
-    var ASSET_RECORD_TYPE = 'customrecord_nx_asset';
-    var ASSET_CUSTOMER_FIELD = 'custrecord_nx_asset_customer';
-    var ASSET_ZD_ID_FIELD = 'custrecord_asset_id';
-    var SAMPLE_ASSET_ID = '232';     // a CHILD asset (has a parent) - parent is read too
-    var FOLDER_ID = '';              // File Cabinet folder internal ID for the CSV ('' = logs only)
+    // =====================================================
+    // 2. NETSUITE IDS
+    // =====================================================
+    var ASSET_RECORD_TYPE = 'customrecord_nx_asset';  // Field Service Asset record
+    var SEARCH_ID = 'customsearch_mytra_field_service_asset';  // saved search
 
-    // Fields the sync script sets itself (do not map)
-    var SET_BY_SCRIPT = {
-        org:   ['external_id', 'id'],
-        asset: ['external_id', 'organization_id', 'id', 'asset_type_id', 'status_id'],
-        asm:   ['external_id', 'bot_parent', 'id']
+    // TEST: put one asset internal ID (e.g. '232') to process only that asset.
+    // Leave '' to process everything the saved search returns.
+    var TEST_ASSET_ID = '';
+
+    var ASSET = {
+        zdAssetId:      'custrecord_asset_id',          // Zendesk ID written back (asset ID or assembly_item ID)
+        parent:         'parent',                       // VERIFY: Field Help on "Parent"
+        name:           'name',
+        customer:       'custrecord_nx_asset_customer',
+        item:           'custrecord_nx_asset_item',
+        serial:         'custrecord_nx_asset_serial',
+        assetType:      'custrecord_nx_asset_type',
+        status:         'custrecord_asset_statuses',
+        contractStatus: 'custrecord_asset_status',
+        warrantyEnd:    'custrecord_warranty_end_date',
+
+        // CHILD (assembly_item) extra fields - put field IDs, '' = not sent
+        revision:       '',
+        unitCost:       '',
+        unitOfMeasure:  '',
+        installDate:    ''
     };
-    var ORG_STANDARD = ['name', 'details', 'notes', 'domain_names', 'tags', 'group_id',
-                        'shared_tickets', 'shared_comments', 'external_id'];
-    var ASSET_STANDARD = ['name', 'asset_tag', 'serial_number', 'manufacturer', 'model',
-                          'purchase_date', 'purchase_cost', 'vendor', 'warranty_expiration',
-                          'notes', 'user_id', 'location_id', 'status_id', 'asset_type_id',
-                          'organization_id', 'external_id'];
 
-    var COLS = ['Section', 'Group', 'Key / Field ID', 'Title / Label', 'Type', 'Kind / Info',
-                'Search label', 'Value (child)', 'Value (parent)'];
+    var CUST = {
+        zdOrgId: 'custentity_organization_id'
+    };
 
     // =====================================================
     // HELPERS
     // =====================================================
-    function parse(b) { try { return JSON.parse(b); } catch (e) { return { raw: b }; } }
-
-    function token() {
-        var s = ZD.CLIENT_SECRET;
-        if (!s || s.indexOf('PASTE_') === 0) throw Error('Set ZD.CLIENT_SECRET at the top of the script');
-        var res = https.post({
-            url: ZD.BASE_URL + '/oauth/tokens',
-            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ grant_type: 'client_credentials', client_id: ZD.CLIENT_ID,
-                                   client_secret: s, scope: ZD.SCOPE })
-        });
-        var d = parse(res.body);
-        if (Number(res.code) !== 200 || !d.access_token) throw Error('OAuth failed: ' + res.code + ' ' + res.body);
-        return d.access_token;
+    function parse(body) {
+        try { return JSON.parse(body); } catch (e) { return { raw: body }; }
     }
 
-    function zget(tok, ep) {
-        var res = https.get({
-            url: ZD.BASE_URL + ep,
-            headers: { Authorization: 'Bearer ' + tok, Accept: 'application/json' }
+    function norm(v) {
+        return String(v || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    }
+
+    function toIsoDate(nsDate) {
+        if (!nsDate) return '';
+        try {
+            var d = format.parse({ value: nsDate, type: format.Type.DATE });
+            return d.getFullYear() + '-' +
+                ('0' + (d.getMonth() + 1)).slice(-2) + '-' +
+                ('0' + d.getDate()).slice(-2);
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function clean(obj) {
+        var out = {};
+        Object.keys(obj).forEach(function (k) {
+            if (obj[k] !== '' && obj[k] !== null && obj[k] !== undefined) out[k] = obj[k];
         });
-        var out = { code: Number(res.code), data: parse(res.body) };
-        if (out.code !== 200) log.error('Zendesk GET ' + ep, { httpCode: out.code, response: out.data });
         return out;
     }
 
-    function firstArray(d, keys) {
-        for (var i = 0; i < keys.length; i++) if (d && Array.isArray(d[keys[i]])) return d[keys[i]];
-        return [];
-    }
+    function api(token, method, endpoint, payload) {
+        var opts = {
+            url: ZD.BASE_URL + endpoint,
+            headers: {
+                Authorization: 'Bearer ' + token,
+                Accept: 'application/json',
+                'Content-Type': 'application/json'
+            }
+        };
+        if (payload) opts.body = JSON.stringify(payload);
 
-    function suffix(type) {
-        var t = String(type || '').toLowerCase();
-        if (t === 'date') return '|date';
-        if (t === 'decimal' || t === 'currency' || t === 'number') return '|number';
-        if (t === 'integer') return '|integer';
-        if (t === 'checkbox' || t === 'boolean') return '|bool';
-        if (t === 'multiselect' || t === 'tagger_multi' || t === 'tags' || t === 'array') return '|list';
-        return '';
-    }
+        var res = method === 'POST' ? https.post(opts) : https.get(opts);
+        var out = { code: Number(res.code), data: parse(res.body) };
 
-    function stripStd(k) { return String(k || '').replace(/^standard::/, ''); }
-
-    function labelFor(pStd, pCf, key, type, isStd, scriptSet) {
-        if (scriptSet.indexOf(key) >= 0) return '(set by script - do not map)';
-        if (String(type).toLowerCase() === 'lookup') return '(lookup - do not map)';
-        return (isStd ? pStd : pCf) + '.' + key + suffix(type);
-    }
-
-    function row(section, group, key, title, type, info, label, v1, v2) {
-        return { s: section, g: group || '', k: key || '', t: title || '', ty: type || '',
-                 i: info || '', l: label || '', v1: v1 == null ? '' : String(v1),
-                 v2: v2 == null ? '' : String(v2) };
-    }
-
-    function fieldInfo(rec, id) {
-        var f = null, v = '', t = '';
-        try { f = rec.getField({ fieldId: id }); } catch (e) { f = null; }
-        try { v = rec.getValue({ fieldId: id }); } catch (e) { v = ''; }
-        try { t = rec.getText({ fieldId: id }); } catch (e) { t = ''; }
-        if (Array.isArray(v)) v = v.join(', ');
-        if (Array.isArray(t)) t = t.join(', ');
-        var shown = (t && String(t) !== String(v)) ? t + ' [' + v + ']' : v;
-        return { label: f ? f.label : '', type: f ? f.type : '', value: shown == null ? '' : String(shown) };
-    }
-
-    function interesting(id) {
-        return !/^(_|nsapi|ns_|nlloc|nlsub|nldept|nlclass|wfinstances|sys_|baserecordtype|rectype|externalid_|entryformquerystring|customwhence|linenumber|nsbrowserenv|selectedtab|submitnext|templatestored|type$|id$|_eml|ntype|wfvalidation)/i.test(id);
-    }
-
-    function loadAssets() {
-        var child = record.load({ type: ASSET_RECORD_TYPE, id: SAMPLE_ASSET_ID });
-        var parentId = '', parent = null;
-        try { parentId = child.getValue({ fieldId: 'parent' }) || ''; } catch (e) { parentId = ''; }
-        if (parentId) {
-            try { parent = record.load({ type: ASSET_RECORD_TYPE, id: parentId }); } catch (e) { parent = null; }
+        if (out.code < 200 || out.code >= 300) {
+            log.error('Zendesk ' + method + ' ' + endpoint, {
+                httpCode: out.code, request: payload || null, response: out.data
+            });
         }
-        return { child: child, parent: parent, parentId: String(parentId) };
+        return out;
+    }
+
+    function getToken() {
+        var secret = ZD.CLIENT_SECRET;
+
+        var res = https.post({
+            url: ZD.BASE_URL + '/oauth/tokens',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({
+                grant_type: 'client_credentials',
+                client_id: ZD.CLIENT_ID,
+                client_secret: secret,
+                scope: ZD.SCOPE
+            })
+        });
+
+        var data = parse(res.body);
+        if (Number(res.code) !== 200 || !data.access_token) {
+            throw Error('Zendesk OAuth failed: ' + res.code + ' ' + JSON.stringify(data));
+        }
+        return data.access_token;
+    }
+
+    function saveZdId(recType, id, fieldId, zdId) {
+        var v = {};
+        v[fieldId] = String(zdId);
+        record.submitFields({
+            type: recType, id: id, values: v,
+            options: { enableSourcing: false, ignoreMandatoryFields: true }
+        });
     }
 
     // =====================================================
-    // SECTIONS
+    // SAVED SEARCH COLUMNS  (Custom Label in the search -> script key)
+    //   t: true  = read the TEXT of the column (list/record fields)
+    //   req: true = column must exist in the search
     // =====================================================
-    function zdOrg() {
-        var tok = token(), rows = [];
-        ORG_STANDARD.forEach(function (k) {
-            var t = (k === 'domain_names' || k === 'tags') ? 'array' : (k.indexOf('shared') === 0 ? 'checkbox' : 'text');
-            rows.push(row('ZD_ORG', 'Organization', k, k, t, 'standard',
-                          labelFor('org', 'org_cf', k, t, true, SET_BY_SCRIPT.org)));
+    var SEARCH_LABELS = {
+        // ----- Asset -----
+        id:             { label: 'id',              req: true },
+        name:           { label: 'name',            req: true },
+        parentId:       { label: 'parent_id',       req: true },
+        parentZdId:     { label: 'parent_zd_id',    req: true },
+        customerId:     { label: 'customer_id',     req: true },
+        assetType:      { label: 'asset_type',      t: true }, // name, e.g. "Bot"; blank OK on children
+        itemText:       { label: 'item',            t: true },
+        serial:         { label: 'serial' },
+        status:         { label: 'status',          t: true },
+        contractStatus: { label: 'contract_status', t: true },
+        warrantyEnd:    { label: 'warranty_end' },
+        revision:       { label: 'revision' },
+        unitCost:       { label: 'unit_cost' },
+        unitOfMeasure:  { label: 'unit_of_measure', t: true },
+        installDate:    { label: 'install_date' },
+
+        // ----- Customer (Zendesk Organization) -----
+        c_zdOrgId:      { label: 'cust_zd_org_id',  req: true },
+        c_company:      { label: 'cust_company',    req: true },
+        c_entityid:     { label: 'cust_entityid' },
+        c_addr1:        { label: 'cust_address' },
+        c_city:         { label: 'cust_city' },
+        c_state:        { label: 'cust_state' },
+        c_zip:          { label: 'cust_zip' },
+        c_email:        { label: 'cust_email' },
+        c_phone:        { label: 'cust_phone' }
+    };
+
+    function columnIndex(columns) {
+        var byLabel = {};
+        columns.forEach(function (col) {
+            if (col.label) byLabel[String(col.label).trim().toLowerCase()] = col;
         });
-        var of = zget(tok, '/api/v2/organization_fields.json');
-        firstArray(of.data, ['organization_fields']).forEach(function (f) {
-            rows.push(row('ZD_ORG', 'Organization', f.key, f.title, f.type,
-                          f.active === false ? 'custom (INACTIVE)' : 'custom',
-                          labelFor('org', 'org_cf', f.key, f.type, false, SET_BY_SCRIPT.org)));
+
+        var missing = [];
+        Object.keys(SEARCH_LABELS).forEach(function (k) {
+            var d = SEARCH_LABELS[k];
+            if (d.req && !byLabel[d.label]) missing.push(d.label);
         });
-        return rows;
+        if (missing.length) {
+            throw Error('Saved search is missing columns with Custom Label: ' + missing.join(', '));
+        }
+        return byLabel;
     }
 
-    function zdAsset() {
-        var tok = token(), rows = [];
+    function rowToObj(r, byLabel) {
+        var o = {};
+        Object.keys(SEARCH_LABELS).forEach(function (k) {
+            var d = SEARCH_LABELS[k];
+            var col = byLabel[d.label];
+            if (!col) { o[k] = ''; return; }
+            var v = d.t ? (r.getText(col) || r.getValue(col)) : r.getValue(col);
+            o[k] = v == null ? '' : String(v);
+        });
+        o.name = cleanName(o.name);
+        return o;
+    }
 
-        // sample asset to tell standard vs custom: parent's Zendesk asset, else first asset
-        var sample = null;
-        try {
-            var a = loadAssets();
-            var pz = a.parent ? a.parent.getValue({ fieldId: ASSET_ZD_ID_FIELD }) : '';
-            if (pz) {
-                var s1 = zget(tok, '/api/v2/it_asset_management/assets/' + encodeURIComponent(pz));
-                sample = s1.data && s1.data.asset;
-            }
-        } catch (e) { sample = null; }
-        if (!sample) {
-            var s2 = zget(tok, '/api/v2/it_asset_management/assets?page[size]=1');
-            sample = firstArray(s2.data, ['assets'])[0] || null;
+    // "Parent Name : Child Name" -> "Child Name"
+    function cleanName(n) {
+        var parts = String(n || '').split(' : ');
+        return parts[parts.length - 1].trim();
+    }
+
+    function custFrom(o) {
+        return {
+            zdOrgId: o.c_zdOrgId, company: o.c_company, entityid: o.c_entityid,
+            addr1: o.c_addr1, city: o.c_city, state: o.c_state, zip: o.c_zip,
+            email: o.c_email, phone: o.c_phone
+        };
+    }
+
+    // =====================================================
+    // ORGANIZATION
+    // =====================================================
+    function readCustomer(customerId) {
+        var c = search.lookupFields({
+            type: search.Type.CUSTOMER, id: customerId,
+            columns: [CUST.zdOrgId, 'companyname', 'entityid', 'billaddress1',
+                      'billcity', 'billstate', 'billzipcode', 'email', 'phone']
+        });
+        var st = c.billstate;
+        return {
+            zdOrgId: c[CUST.zdOrgId], company: c.companyname, entityid: c.entityid,
+            addr1: c.billaddress1, city: c.billcity,
+            state: Array.isArray(st) ? (st.length ? st[0].value : '') : st,
+            zip: c.billzipcode, email: c.email, phone: c.phone
+        };
+    }
+
+    function getOrCreateOrg(S, customerId, cust) {
+        if (S.orgCache[customerId]) return S.orgCache[customerId];
+
+        cust = cust || readCustomer(customerId);
+        if (cust.zdOrgId) {
+            S.orgCache[customerId] = String(cust.zdOrgId);
+            return S.orgCache[customerId];
         }
-        var sampleTop = sample ? Object.keys(sample) : [];
-        if (sample) log.audit('ZD_ASSET sample asset (raw)', JSON.stringify(sample).slice(0, 3900));
 
-        var at = zget(tok, '/api/v2/it_asset_management/asset_types');
-        firstArray(at.data, ['asset_types']).forEach(function (t) {
-            var fr = zget(tok, '/api/v2/it_asset_management/asset_types/' + encodeURIComponent(t.id) + '/fields');
-            var fields = firstArray(fr.data, ['fields', 'asset_fields', 'asset_type_fields', 'custom_object_fields']);
-            if (!fields.length) {
-                rows.push(row('ZD_ASSET', t.name + ' (' + t.id + ')', '', '', '', 'no fields returned (HTTP ' + fr.code + ')', ''));
+        var orgName = cust.company || cust.entityid;
+        if (!orgName) throw Error('Customer ' + customerId + ' has no name');
+
+        var org = { name: String(orgName), external_id: 'NS-CUST-' + customerId };
+        var orgFields = clean({
+            street_address: cust.addr1,
+            city:           cust.city,
+            state:          cust.state,
+            zip_code:       cust.zip,
+            poc_email:      cust.email,
+            poc_phone:      cust.phone
+        });
+        if (Object.keys(orgFields).length) org.organization_fields = orgFields;
+
+        var ep = '/api/v2/organizations/create_or_update.json';
+        var res = api(S.token, 'POST', ep, { organization: org });
+        var orgId = res.data.organization && res.data.organization.id;
+
+        // Address/phone format rejected -> create with name only
+        if (!orgId && org.organization_fields) {
+            log.audit('Org retry without organization_fields', orgName);
+            delete org.organization_fields;
+            res = api(S.token, 'POST', ep, { organization: org });
+            orgId = res.data.organization && res.data.organization.id;
+        }
+
+        // Name already used in Zendesk -> reuse that org
+        if (!orgId && res.code === 422) {
+            var f = api(S.token, 'GET',
+                '/api/v2/organizations/search.json?name=' + encodeURIComponent(orgName));
+            var orgs = (f.data && f.data.organizations) || [];
+            if (orgs.length === 1) orgId = orgs[0].id;
+        }
+
+        if (!orgId) throw Error('Could not create/find Zendesk Organization for ' + orgName);
+
+        saveZdId(record.Type.CUSTOMER, customerId, CUST.zdOrgId, orgId);
+        log.audit('ORG CREATED', { customerId: customerId, zendeskOrgId: orgId });
+
+        S.orgCache[customerId] = String(orgId);
+        return S.orgCache[customerId];
+    }
+
+    // =====================================================
+    // STATUS
+    // =====================================================
+    function getStatusId(S, nsStatus) {
+        if (!nsStatus) return ZD.DEFAULT_STATUS_ID;
+
+        if (!S.statuses) {
+            var res = api(S.token, 'GET', '/api/v2/it_asset_management/statuses');
+            if (res.code !== 200) throw Error('Could not read Zendesk statuses');
+            S.statuses = res.data.statuses || [];
+        }
+
+        var key = norm(nsStatus);
+        for (var i = 0; i < S.statuses.length; i++) {
+            if (norm(S.statuses[i].name) === key || norm(S.statuses[i].external_id) === key) {
+                return String(S.statuses[i].id);
             }
-            fields.forEach(function (f) {
-                var key = stripStd(f.key);
-                var isStd = String(f.key).indexOf('standard::') === 0 || f.system === true ||
-                            ASSET_STANDARD.indexOf(key) >= 0 || sampleTop.indexOf(key) >= 0;
-                var info = (isStd ? 'standard' : 'custom') + (f.active === false ? ' (INACTIVE)' : '');
-                if (f.custom_field_options && f.custom_field_options.length) {
-                    info += ' | options: ' + f.custom_field_options.map(function (o) { return o.value; }).join(', ');
-                }
-                rows.push(row('ZD_ASSET', t.name + ' (' + t.id + ')', key, f.title || f.name, f.type, info,
-                              labelFor('asset', 'asset_cf', key, f.type, isStd, SET_BY_SCRIPT.asset)));
+        }
+        var mapped = ZD.STATUS_MAP[String(nsStatus).trim().toLowerCase()];
+        if (mapped) return mapped;
+
+        throw Error('No Zendesk status for NetSuite status "' + nsStatus + '"');
+    }
+
+    // =====================================================
+    // ASSET TYPE: NetSuite type name -> Zendesk type ID (by name)
+    // =====================================================
+    function getAssetTypeId(S, nsTypeName) {
+        if (!S.assetTypes) {
+            var res = api(S.token, 'GET', '/api/v2/it_asset_management/asset_types');
+            if (res.code !== 200) throw Error('Could not read Zendesk asset types');
+            S.assetTypes = res.data.asset_types || [];
+        }
+
+        function find(name) {
+            var k = norm(name);
+            if (!k) return '';
+            for (var i = 0; i < S.assetTypes.length; i++) {
+                if (norm(S.assetTypes[i].name) === k) return String(S.assetTypes[i].id);
+            }
+            return '';
+        }
+
+        var id = find(nsTypeName) || find(ZD.PARENT_TYPE_NAME);
+        if (!id) {
+            throw Error('No Zendesk asset type for "' + (nsTypeName || '(blank)') +
+                '". Zendesk has: ' + S.assetTypes.map(function (t) { return t.name; }).join(', '));
+        }
+        return id;
+    }
+
+    // =====================================================
+    // CREATE PARENT (ITAM asset)
+    // =====================================================
+    function createParentAsset(S, a, cust) {
+        if (!a.name || !a.customerId) throw Error('Asset ' + a.id + ': Name or Customer missing');
+
+        var typeId = getAssetTypeId(S, a.assetType);
+        var orgId = getOrCreateOrg(S, a.customerId, cust);
+
+        var asset = {
+            name: a.name,
+            external_id: 'NS-ASSET-' + a.id,
+            asset_type_id: typeId,
+            status_id: getStatusId(S, a.status),
+            organization_id: Number(orgId),
+            manufacturer: ZD.DEFAULT_MANUFACTURER
+        };
+        if (a.serial) asset.serial_number = a.serial;
+        if (a.itemText) asset.model = a.itemText;
+        var w = toIsoDate(a.warrantyEnd);
+        if (w) asset.warranty_expiration = w;
+        if (ZD.CONTRACT_STATUS_KEY && a.contractStatus) {
+            asset.custom_field_values = {};
+            asset.custom_field_values[ZD.CONTRACT_STATUS_KEY] = a.contractStatus;
+        }
+
+        var res = api(S.token, 'POST', '/api/v2/it_asset_management/assets', { asset: asset });
+        if (res.code !== 201 || !res.data.asset || !res.data.asset.id) {
+            throw Error('Parent asset ' + a.id + ' create failed: HTTP ' + res.code);
+        }
+
+        var zdId = String(res.data.asset.id);
+        saveZdId(ASSET_RECORD_TYPE, a.id, ASSET.zdAssetId, zdId);
+        log.audit('PARENT ASSET CREATED', { netsuiteId: a.id, zendeskAssetId: zdId, zendeskOrgId: orgId });
+        return zdId;
+    }
+
+    // Parent not in this batch and has no Zendesk ID -> read it and create it
+    function readAsset(id) {
+        var cols = ['name', ASSET.zdAssetId, ASSET.customer, ASSET.item, ASSET.serial,
+                    ASSET.assetType, ASSET.status, ASSET.contractStatus, ASSET.warrantyEnd];
+        var r = search.lookupFields({ type: ASSET_RECORD_TYPE, id: id, columns: cols });
+        function v(f) { var x = r[f]; return Array.isArray(x) ? (x.length ? x[0].value : '') : (x || ''); }
+        function t(f) { var x = r[f]; return Array.isArray(x) ? (x.length ? x[0].text : '') : (x || ''); }
+        return {
+            id: String(id), name: cleanName(t('name')), zdId: v(ASSET.zdAssetId),
+            customerId: v(ASSET.customer), itemText: t(ASSET.item), serial: t(ASSET.serial),
+            assetType: t(ASSET.assetType), status: t(ASSET.status),
+            contractStatus: t(ASSET.contractStatus), warrantyEnd: t(ASSET.warrantyEnd)
+        };
+    }
+
+    // =====================================================
+    // CREATE CHILD (assembly_item custom object record)
+    // =====================================================
+    function createChild(S, c, parentZdId) {
+        // Item Number: from Item, else from the asset name (e.g. "MYT-00242-01 (...)")
+        var itemNo = (String(c.itemText).match(/MYT-\d{5}-\d{2}/) ||
+                      String(c.name).match(/MYT-\d{5}-\d{2}/) || [''])[0];
+
+        // Serial: Zendesk regex = MYT-12345-12-12345 (anywhere in the value)
+        var rawSerial = String(c.serial || '').trim();
+        var serial = /\bMYT-\d{5}-\d{2}-\d{5}\b/.test(rawSerial) ? rawSerial : '';
+        if (rawSerial && !serial) log.audit('Serial skipped (format)', { asset: c.id, serial: rawSerial });
+
+        var fields = clean({
+            bot_parent:      parentZdId,
+            item_number:     itemNo,
+            serial_number:   serial,
+            revision:        c.revision !== '' ? parseInt(c.revision, 10) : '',
+            unit_cost:       c.unitCost !== '' ? parseFloat(c.unitCost) : '',
+            unit_of_measure: c.unitOfMeasure,
+            install_date:    toIsoDate(c.installDate)
+        });
+        if (isNaN(fields.revision)) delete fields.revision;
+        if (isNaN(fields.unit_cost)) delete fields.unit_cost;
+
+        var payload = {
+            custom_object_record: {
+                name: c.name || itemNo || ('Assembly ' + c.id),
+                external_id: 'NS-ASM-' + c.id,
+                custom_object_fields: fields
+            }
+        };
+
+        var ep = '/api/v2/custom_objects/' + ZD.CHILD_OBJECT_KEY + '/records';
+        var res = api(S.token, 'POST', ep, payload);
+        var rec = res.data && res.data.custom_object_record;
+
+        // Serial rejected by Zendesk format -> create without it
+        if ((!rec || !rec.id) && res.code === 422 && fields.serial_number) {
+            log.audit('Child retry without serial_number', { asset: c.id, serial: fields.serial_number });
+            delete payload.custom_object_record.custom_object_fields.serial_number;
+            res = api(S.token, 'POST', ep, payload);
+            rec = res.data && res.data.custom_object_record;
+        }
+        if (!rec || !rec.id) throw Error('Child ' + c.id + ' create failed: HTTP ' + res.code);
+
+        saveZdId(ASSET_RECORD_TYPE, c.id, ASSET.zdAssetId, rec.id);
+        log.audit('CHILD CREATED', { netsuiteId: c.id, assemblyItemId: rec.id, botParent: parentZdId });
+        return rec.id;
+    }
+
+    // =====================================================
+    // GET INPUT DATA
+    // =====================================================
+    function getInputData() {
+        var searchId = SEARCH_ID;
+        var onlyId = TEST_ASSET_ID;
+
+        var s = search.load({ id: searchId });
+
+        // Test mode: only one asset
+        if (onlyId) {
+            s.filters.push(search.createFilter({
+                name: 'internalid', operator: search.Operator.ANYOF, values: [String(onlyId)]
+            }));
+        }
+
+        var byLabel = columnIndex(s.columns);
+
+        var rows = [];
+        var paged = s.runPaged({ pageSize: 1000 });
+        paged.pageRanges.forEach(function (pr) {
+            paged.fetch({ index: pr.index }).data.forEach(function (r) {
+                var o = rowToObj(r, byLabel);
+                if (!o.id) o.id = String(r.id);
+                rows.push(o);
             });
         });
 
-        // statuses (for reference)
-        var st = zget(tok, '/api/v2/it_asset_management/statuses');
-        firstArray(st.data, ['statuses']).forEach(function (s) {
-            rows.push(row('ZD_ASSET', 'Statuses', s.id, s.name, 'status', 'map NetSuite status text to this name', 'asset.status'));
-        });
+        log.audit('INPUT', { savedSearch: searchId, assetsToProcess: rows.length, onlyAssetId: onlyId || 'all' });
         return rows;
     }
-
-    function zdAsm() {
-        var tok = token(), rows = [];
-        var cf = zget(tok, '/api/v2/custom_objects/' + ZD.CHILD_OBJECT_KEY + '/fields?include_standard_fields=true');
-        firstArray(cf.data, ['custom_object_fields']).forEach(function (f) {
-            var key = stripStd(f.key);
-            var info = f.regexp_for_validation ? 'regex: ' + f.regexp_for_validation : '';
-            if (f.custom_field_options && f.custom_field_options.length) {
-                info = 'options: ' + f.custom_field_options.map(function (o) { return o.value; }).join(', ');
-            }
-            var label = key === 'name' ? 'asm.name' : labelFor('asm', 'asm', key, f.type, true, SET_BY_SCRIPT.asm);
-            rows.push(row('ZD_ASM', ZD.CHILD_OBJECT_KEY, key, f.title, f.type, info, label));
-        });
-        return rows;
-    }
-
-    function nsAsset() {
-        var a = loadAssets(), rows = [];
-        var ids = a.child.getFields().filter(interesting);
-        if (a.parent) a.parent.getFields().filter(interesting).forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
-        ids.sort().forEach(function (id) {
-            var c = fieldInfo(a.child, id);
-            var p = a.parent ? fieldInfo(a.parent, id) : { label: '', type: '', value: '' };
-            rows.push(row('NS_ASSET', 'child ' + SAMPLE_ASSET_ID + ' / parent ' + (a.parentId || '-'),
-                          id, c.label || p.label, c.type || p.type, 'search column name: "' + id + '"', '',
-                          c.value, p.value));
-        });
-        return rows;
-    }
-
-    function nsCustomer() {
-        var a = loadAssets(), rows = [];
-        var custId = (a.parent && a.parent.getValue({ fieldId: ASSET_CUSTOMER_FIELD })) ||
-                     a.child.getValue({ fieldId: ASSET_CUSTOMER_FIELD });
-        if (!custId) return [row('NS_CUSTOMER', '', '', '', '', 'asset has no customer', '')];
-        var cust = record.load({ type: record.Type.CUSTOMER, id: custId });
-        cust.getFields().filter(interesting).sort().forEach(function (id) {
-            var c = fieldInfo(cust, id);
-            if (!c.label && !c.value) return;
-            rows.push(row('NS_CUSTOMER', 'customer ' + custId, id, c.label, c.type,
-                          'join: "CUSTRECORD_NX_ASSET_CUSTOMER"', '', c.value));
-        });
-        return rows;
-    }
-
-    var SECTIONS = { ZD_ORG: zdOrg, ZD_ASSET: zdAsset, ZD_ASM: zdAsm, NS_ASSET: nsAsset, NS_CUSTOMER: nsCustomer };
-    var ORDER = ['ZD_ORG', 'ZD_ASSET', 'ZD_ASM', 'NS_ASSET', 'NS_CUSTOMER'];
 
     // =====================================================
-    // MAP / REDUCE
+    // MAP: group child with its parent
     // =====================================================
-    function getInputData() {
-        return ORDER;
-    }
-
     function map(context) {
-        var section = context.value;
-        var rows;
-        try {
-            rows = SECTIONS[section]();
-        } catch (e) {
-            log.error(section + ' FAILED', e.message);
-            rows = [row(section, 'ERROR', '', '', '', e.message, '')];
-        }
-        rows.forEach(function (r, i) {
-            r.n = i;
-            context.write({ key: section, value: r });
-        });
+        var a = JSON.parse(context.value);
+        context.write({ key: String(a.parentId || a.id), value: a });
     }
 
-    function summarize(summary) {
-        summary.inputSummary.error && log.error('INPUT ERROR', summary.inputSummary.error);
-        summary.mapSummary.errors.iterator().each(function (k, e) { log.error('MAP ERROR ' + k, e); return true; });
+    // =====================================================
+    // REDUCE: one parent + all its children
+    // =====================================================
+    function reduce(context) {
+        var rootId = context.key;
+        var items = context.values.map(function (v) { return JSON.parse(v); });
 
-        var bySection = {};
+        var root = null, children = [];
+        items.forEach(function (a) {
+            if (!a.parentId && String(a.id) === rootId) root = a; else children.push(a);
+        });
+
+        var S = { token: getToken(), orgCache: {}, statuses: null, assetTypes: null };
+        var ok = 0, failed = 0;
+
+        // ---------- parent ----------
+        var parentZdId = '';
+        children.forEach(function (c) { if (c.parentZdId) parentZdId = c.parentZdId; });
+
+        try {
+            if (root && !parentZdId) {
+                parentZdId = createParentAsset(S, root, custFrom(root));
+                ok++;
+            } else if (!parentZdId && children.length) {
+                var p = readAsset(rootId);
+                parentZdId = p.zdId || createParentAsset(S, p, null);
+                if (!p.zdId) ok++;
+            }
+        } catch (e) {
+            log.error('PARENT FAILED ' + rootId, e.message);
+            context.write({ key: 'failed', value: 1 + children.length });
+            return; // children need the parent
+        }
+
+        // ---------- children ----------
+        children.forEach(function (c) {
+            try {
+                createChild(S, c, parentZdId);
+                ok++;
+            } catch (e) {
+                failed++;
+                log.error('CHILD FAILED ' + c.id, e.message);
+            }
+        });
+
+        if (ok) context.write({ key: 'ok', value: ok });
+        if (failed) context.write({ key: 'failed', value: failed });
+    }
+
+    // =====================================================
+    // SUMMARIZE
+    // =====================================================
+    function summarize(summary) {
+        var totals = { ok: 0, failed: 0 };
         summary.output.iterator().each(function (k, v) {
-            (bySection[k] = bySection[k] || []).push(JSON.parse(v));
+            totals[k] = (totals[k] || 0) + Number(v);
             return true;
         });
 
-        var all = [];
-        ORDER.forEach(function (sec) {
-            var rows = (bySection[sec] || []).sort(function (a, b) { return a.n - b.n; });
-            all = all.concat(rows);
+        summary.inputSummary.error && log.error('INPUT ERROR', summary.inputSummary.error);
+        summary.mapSummary.errors.iterator().each(function (k, e) { log.error('MAP ERROR ' + k, e); return true; });
+        summary.reduceSummary.errors.iterator().each(function (k, e) { log.error('REDUCE ERROR ' + k, e); return true; });
 
-            // readable log, chunked (Execution Log detail max ~3999 chars)
-            var lines = rows.map(function (r) {
-                return [r.g, r.k, r.t, r.ty, r.l || r.i, r.v1, r.v2].filter(function (x) { return x !== ''; }).join(' | ');
-            });
-            var chunk = '', part = 1;
-            lines.forEach(function (ln) {
-                if ((chunk + ln).length > 3800) {
-                    log.audit(sec + ' (' + rows.length + ' rows) part ' + part++, chunk);
-                    chunk = '';
-                }
-                chunk += ln + '\n';
-            });
-            if (chunk) log.audit(sec + ' (' + rows.length + ' rows) part ' + part, chunk);
+        log.audit('ZENDESK SYNC DONE', {
+            created: totals.ok,
+            failed: totals.failed,
+            seconds: summary.seconds,
+            usage: summary.usage
         });
-
-        if (FOLDER_ID) {
-            var csvEsc = function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
-            var csv = COLS.map(csvEsc).join(',') + '\n' + all.map(function (r) {
-                return [r.s, r.g, r.k, r.t, r.ty, r.i, r.l, r.v1, r.v2].map(csvEsc).join(',');
-            }).join('\n');
-            var f = file.create({
-                name: 'zendesk_field_discovery_' + new Date().getTime() + '.csv',
-                fileType: file.Type.CSV, contents: csv, folder: Number(FOLDER_ID)
-            });
-            var fileId = f.save();
-            log.audit('DISCOVERY CSV SAVED', { fileId: fileId, rows: all.length });
-        } else {
-            log.audit('DISCOVERY DONE', { rows: all.length, note: 'Set FOLDER_ID to also get a CSV file' });
-        }
     }
 
-    // no reduce stage: map output goes straight to summarize
-    return { getInputData: getInputData, map: map, summarize: summarize };
+    return { getInputData: getInputData, map: map, reduce: reduce, summarize: summarize };
 });
