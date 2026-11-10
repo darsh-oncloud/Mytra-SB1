@@ -3,68 +3,34 @@
  * @NScriptType MapReduceScript
  * @NModuleScope SameAccount
  *
- * Zendesk Ticket -> NetSuite Support Case  (CREATE ONLY)
+ * ZENDESK TICKET DISCOVERY (READ-ONLY)
+ * Creates nothing in Zendesk or NetSuite. Logs (Execution Log):
  *
- * For each Zendesk ticket:
- *   1. Asset         -> NetSuite Field Service Asset whose custrecord_asset_id = asset on the ticket
- *                       (ITAM asset or assembly_item lookup fields on the ticket)
- *   2. Customer      -> NetSuite Customer whose custentity_organization_id = ticket.organization_id,
- *                       or, when the ticket has no organization, the asset's Customer
- *   3. Both found    -> create the Support Case (externalid = ZD-<ticket id>)
- *      Not found     -> skipped, reason counted in SKIP REASONS (create Org/Asset first, then re-run)
- * Tickets that already have a case (externalid ZD-<id>) are skipped.
+ *   TICKET FIELDS   every ticket field: id | title | type | target (lookups) | active
+ *   TICKET STATS    over all tickets: totals, by status, with organization / requester,
+ *                   and for EVERY field: how many tickets have a value + sample values
+ *   SAMPLE TICKETS  a few raw tickets (preferring ones that have an asset), with the
+ *                   requester's organization, so you can see exactly what Zendesk sends
  *
- * TEST:  TEST_ALL_TICKETS = true  -> every ticket in Zendesk
- * LIVE:  TEST_ALL_TICKETS = false -> only tickets created in the last LOOKBACK_HOURS
- * One ticket: TEST_TICKET_ID = '123'
- *
- * No script parameters: set everything below.
+ * No script parameters: set the constants below.
  */
-define(['N/https', 'N/record', 'N/search', 'N/log'],
-function (https, record, search, log) {
+define(['N/https', 'N/log'], function (https, log) {
 
-    // =====================================================
-    // CONFIG
-    // =====================================================
     var ZD = {
         BASE_URL: 'https://mytra.zendesk.com',
         CLIENT_ID: 'netsuite_fsm_integration',
         CLIENT_SECRET: '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779',
-        SCOPE: 'read',
-
-        // Ticket fields holding the asset (Zendesk ticket field IDs, numbers).
-        // Leave [] to auto-detect every ticket lookup field whose title contains "asset".
-        ASSET_FIELD_IDS: []
+        SCOPE: 'read'
     };
 
-    var TEST_ALL_TICKETS = true;   // true = all tickets (testing), false = new tickets only
-    var LOOKBACK_HOURS = 24;       // live mode: tickets created in the last N hours
-    var TEST_TICKET_ID = '';       // one ticket only, e.g. '1234'
+    var TEST_TICKET_ID = '';   // e.g. '11' -> also logs that one ticket in full
+    var SAMPLE_COUNT = 5;      // raw sample tickets to log
+    var MAX_PAGES = 200;       // safety limit for reading tickets (1000 per page)
 
-    var REQUIRE_ASSET = true;      // false = create the case even when no asset is found
-
-    // NetSuite field IDs
-    var CUST_ZD_ORG_FIELD = 'custentity_organization_id';
-    var ASSET_RECORD_TYPE = 'customrecord_nx_asset';
-    var ASSET_ZD_ID_FIELD = 'custrecord_asset_id';
-    var ASSET_CUSTOMER_FIELD = 'custrecord_nx_asset_customer';
-
-    var CASE = {
-        asset:      'custevent_nx_case_asset', // VERIFY: field help on the Case "Asset" field
-        zdTicketId: '',                        // optional custom field for the ticket ID ('' = not set)
-        // Zendesk value -> NetSuite internal ID (Setup > Support > Case Statuses / Priorities)
-        STATUS: { 'new': '1', 'open': '2', 'pending': '2', 'hold': '2', 'solved': '5', 'closed': '5' },
-        PRIORITY: { 'urgent': '1', 'high': '1', 'normal': '2', 'low': '3' },
-        DEFAULT_STATUS: '1',
-        DEFAULT_PRIORITY: '2'
-    };
-
-    // =====================================================
-    // HELPERS
-    // =====================================================
+    // ---------------------------------------------------------------
     function parse(b) { try { return JSON.parse(b); } catch (e) { return { raw: b }; } }
 
-    function getToken() {
+    function token() {
         var s = ZD.CLIENT_SECRET;
         if (!s || s.indexOf('PASTE_') === 0) throw Error('Set ZD.CLIENT_SECRET at the top of the script');
         var res = https.post({
@@ -74,193 +40,160 @@ function (https, record, search, log) {
                                    client_secret: s, scope: ZD.SCOPE })
         });
         var d = parse(res.body);
-        if (Number(res.code) !== 200 || !d.access_token) throw Error('Zendesk OAuth failed: ' + res.code + ' ' + res.body);
+        if (Number(res.code) !== 200 || !d.access_token) throw Error('OAuth failed: ' + res.code + ' ' + res.body);
         return d.access_token;
     }
 
     function zget(tok, urlOrPath) {
         var url = urlOrPath.indexOf('http') === 0 ? urlOrPath : ZD.BASE_URL + urlOrPath;
         var res = https.get({ url: url, headers: { Authorization: 'Bearer ' + tok, Accept: 'application/json' } });
-        var out = { code: Number(res.code), data: parse(res.body) };
-        if (out.code !== 200) {
-            log.error('Zendesk GET ' + urlOrPath, { httpCode: out.code, response: out.data });
-            throw Error('Zendesk GET failed: HTTP ' + out.code);
+        var d = parse(res.body);
+        if (Number(res.code) !== 200) {
+            log.error('Zendesk GET ' + urlOrPath, { httpCode: res.code, response: d });
+            return null;
         }
-        return out.data;
+        return d;
     }
 
-    function assetFieldIds(tok) {
-        if (ZD.ASSET_FIELD_IDS.length) return ZD.ASSET_FIELD_IDS.map(Number);
-        var d = zget(tok, '/api/v2/ticket_fields.json');
-        // only lookups that point at real assets (ITAM asset or assembly_item), not asset types
-        var ids = (d.ticket_fields || []).filter(function (f) {
-            var target = String(f.relationship_target_type || '');
-            return f.type === 'lookup' &&
-                   (/itam_asset$/.test(target) || /custom_object:assembly_item$/.test(target));
+    // log long text in chunks (Execution Log detail max ~3999 chars)
+    function logChunks(title, lines) {
+        var chunk = '', part = 1;
+        lines.forEach(function (ln) {
+            if ((chunk + ln).length > 3800) { log.audit(title + ' part ' + part++, chunk); chunk = ''; }
+            chunk += ln + '\n';
         });
-        log.audit('Asset ticket fields (auto-detected)', ids.map(function (f) {
-            return f.id + ' = ' + f.title + ' -> ' + (f.relationship_target_type || '');
-        }));
-        return ids.map(function (f) { return Number(f.id); });
+        if (chunk) log.audit(title + ' part ' + part, chunk);
     }
 
-    function ticketAssetIds(ticket, fieldIds) {
-        var out = [];
-        (ticket.custom_fields || []).forEach(function (cf) {
-            if (fieldIds.indexOf(Number(cf.id)) < 0 || cf.value == null || cf.value === '') return;
-            (Array.isArray(cf.value) ? cf.value : [cf.value]).forEach(function (v) {
-                if (v) out.push(String(v));
+    function short(v) {
+        var s = typeof v === 'string' ? v : JSON.stringify(v);
+        return s.length > 60 ? s.slice(0, 57) + '...' : s;
+    }
+
+    function hasValue(v) {
+        return !(v === null || v === undefined || v === '' || v === false ||
+                 (Array.isArray(v) && !v.length));
+    }
+
+    // ---------------------------------------------------------------
+    function fieldsSection(tok) {
+        var fields = [], url = '/api/v2/ticket_fields.json?per_page=100';
+        while (url) {
+            var d = zget(tok, url);
+            if (!d) break;
+            fields = fields.concat(d.ticket_fields || []);
+            url = d.next_page || '';
+        }
+        var lines = fields.map(function (f) {
+            return [f.id, f.title, f.type,
+                    f.relationship_target_type ? 'target: ' + f.relationship_target_type : '',
+                    f.active === false ? 'INACTIVE' : 'active',
+                    f.custom_field_options ? 'options: ' + f.custom_field_options.map(function (o) { return o.value; }).join(', ') : '']
+                .filter(function (x) { return x !== ''; }).join(' | ');
+        });
+        logChunks('TICKET FIELDS (' + fields.length + ')', lines);
+        return fields;
+    }
+
+    function statsSection(tok, fields) {
+        var titles = {};
+        fields.forEach(function (f) { titles[f.id] = f.title; });
+
+        var total = 0, byStatus = {}, withOrg = 0, withRequester = 0, withForm = {};
+        var cf = {};          // field id -> { count, samples[] }
+        var top = {};         // top-level attribute -> count
+        var samples = [], fallback = [];
+
+        var url = '/api/v2/incremental/tickets/cursor.json?start_time=0';
+        for (var page = 0; url && page < MAX_PAGES; page++) {
+            var d = zget(tok, url);
+            if (!d) break;
+            (d.tickets || []).forEach(function (t) {
+                if (t.status === 'deleted') return;
+                total++;
+                byStatus[t.status] = (byStatus[t.status] || 0) + 1;
+                if (t.organization_id) withOrg++;
+                if (t.requester_id) withRequester++;
+                withForm[t.ticket_form_id || 'none'] = (withForm[t.ticket_form_id || 'none'] || 0) + 1;
+
+                ['subject', 'description', 'priority', 'type', 'assignee_id', 'group_id', 'brand_id',
+                 'tags', 'external_id', 'due_at', 'via'].forEach(function (k) {
+                    if (hasValue(t[k])) top[k] = (top[k] || 0) + 1;
+                });
+
+                var anyCustom = false;
+                (t.custom_fields || []).forEach(function (c) {
+                    if (!hasValue(c.value)) return;
+                    anyCustom = true;
+                    var e = cf[c.id] = cf[c.id] || { count: 0, samples: [] };
+                    e.count++;
+                    var sv = short(c.value);
+                    if (e.samples.length < 3 && e.samples.indexOf(sv) < 0) e.samples.push(sv);
+                });
+
+                if (anyCustom && samples.length < SAMPLE_COUNT) samples.push(t);
+                else if (fallback.length < SAMPLE_COUNT) fallback.push(t);
             });
+            url = d.end_of_stream ? '' : d.after_url;
+        }
+
+        log.audit('TICKET STATS', {
+            ticketsRead: total,
+            byStatus: byStatus,
+            withOrganization: withOrg,
+            withoutOrganization: total - withOrg,
+            withRequester: withRequester,
+            byTicketFormId: withForm,
+            standardFieldsFilled: top
         });
-        return out;
-    }
 
-    function existingCaseIds() {
-        var ids = {};
-        search.create({
-            type: search.Type.SUPPORT_CASE,
-            filters: [['externalidstring', 'startswith', 'ZD-']],
-            columns: ['externalid']
-        }).run().each(function (r) {
-            ids[String(r.getValue('externalid'))] = true;
-            return true;   // up to 4,000 - fine for this check
+        var lines = Object.keys(cf).sort(function (a, b) { return cf[b].count - cf[a].count; }).map(function (id) {
+            return id + ' | ' + (titles[id] || '(unknown field)') + ' | filled on ' + cf[id].count + ' of ' + total +
+                   ' | e.g. ' + cf[id].samples.join(' ; ');
         });
-        return ids;
+        if (!lines.length) lines = ['No custom field has a value on any ticket'];
+        logChunks('CUSTOM FIELDS WITH VALUES', lines);
+
+        return samples.concat(fallback).slice(0, SAMPLE_COUNT);
     }
 
-    // Skips are counted per reason; only the first few per run are logged individually.
-    var SKIP_LOG_LIMIT = 20, skipLogged = 0;
-    function skip(context, ticketId, reason) {
-        if (skipLogged++ < SKIP_LOG_LIMIT) log.audit('SKIPPED ticket ' + ticketId, reason);
-        context.write({ key: 'skipped', value: 1 });
-        context.write({ key: 'reason: ' + reason.replace(/[0-9A-Z]{20,}|\d{6,}/g, '#'), value: 1 });
+    function logTicket(tok, title, t) {
+        var reqOrg = '';
+        if (t.requester_id) {
+            var u = zget(tok, '/api/v2/users/' + t.requester_id + '.json');
+            if (u && u.user) reqOrg = { requester: u.user.name, email: u.user.email, requesterOrgId: u.user.organization_id };
+        }
+        var slim = {
+            id: t.id, subject: t.subject, status: t.status, priority: t.priority, type: t.type,
+            organization_id: t.organization_id, requester_id: t.requester_id, requester: reqOrg,
+            ticket_form_id: t.ticket_form_id, brand_id: t.brand_id, tags: t.tags, via: t.via && t.via.channel,
+            created_at: t.created_at,
+            custom_fields: (t.custom_fields || []).filter(function (c) { return hasValue(c.value); }),
+            description: String(t.description || '').slice(0, 300)
+        };
+        log.audit(title, JSON.stringify(slim, null, 1).slice(0, 3900));
     }
 
-    function findOne(type, field, value) {
-        var id = '';
-        search.create({ type: type, filters: [[field, 'is', String(value)]], columns: ['internalid'] })
-            .run().each(function (r) { id = r.id; return false; });
-        return id;
-    }
-
-    // =====================================================
-    // GET INPUT DATA: read tickets from Zendesk
-    // =====================================================
+    // ---------------------------------------------------------------
     function getInputData() {
-        var tok = getToken();
-        var fieldIds = assetFieldIds(tok);
-        var done = existingCaseIds();
-        var tickets = [];
+        var tok = token();
+        var fields = fieldsSection(tok);
+        var samples = statsSection(tok, fields);
+
+        samples.forEach(function (t, i) { logTicket(tok, 'SAMPLE TICKET ' + (i + 1) + ' (#' + t.id + ')', t); });
 
         if (TEST_TICKET_ID) {
-            tickets.push(zget(tok, '/api/v2/tickets/' + encodeURIComponent(TEST_TICKET_ID) + '.json').ticket);
-        } else {
-            var since = TEST_ALL_TICKETS ? 0 : Math.floor(Date.now() / 1000) - LOOKBACK_HOURS * 3600;
-            var url = '/api/v2/incremental/tickets/cursor.json?start_time=' + since;
-            for (var guard = 0; url && guard < 500; guard++) {
-                var d = zget(tok, url);
-                (d.tickets || []).forEach(function (t) {
-                    if (t.status === 'deleted') return;
-                    if (!TEST_ALL_TICKETS && new Date(t.created_at).getTime() / 1000 < since) return;
-                    tickets.push(t);
-                });
-                url = d.end_of_stream ? '' : d.after_url;
-            }
+            var one = zget(tok, '/api/v2/tickets/' + encodeURIComponent(TEST_TICKET_ID) + '.json');
+            if (one && one.ticket) logTicket(tok, 'TEST TICKET #' + TEST_TICKET_ID, one.ticket);
         }
-
-        var rows = [];
-        tickets.forEach(function (t) {
-            if (!t || done['ZD-' + t.id]) return;
-            rows.push({
-                id: t.id,
-                subject: t.subject || ('Zendesk ticket ' + t.id),
-                description: t.description || '',
-                status: t.status,
-                priority: t.priority,
-                orgId: t.organization_id ? String(t.organization_id) : '',
-                assetIds: ticketAssetIds(t, fieldIds)
-            });
-        });
-
-        log.audit('INPUT', {
-            mode: TEST_TICKET_ID ? 'one ticket ' + TEST_TICKET_ID : (TEST_ALL_TICKETS ? 'ALL tickets' : 'last ' + LOOKBACK_HOURS + 'h'),
-            ticketsRead: tickets.length,
-            alreadyHaveCase: tickets.length - rows.length,
-            toProcess: rows.length,
-            assetFieldIds: fieldIds
-        });
-        return rows;
+        return [];   // nothing to process: discovery only
     }
 
-    // =====================================================
-    // MAP: one ticket -> one case
-    // =====================================================
-    function map(context) {
-        var t = JSON.parse(context.value);
+    function map(context) { }
 
-        // 1. Asset (Bot or assembly item) -> Field Service Asset
-        var assetId = '';
-        for (var i = 0; i < t.assetIds.length && !assetId; i++) {
-            assetId = findOne(ASSET_RECORD_TYPE, ASSET_ZD_ID_FIELD, t.assetIds[i]);
-        }
-        if (!assetId && REQUIRE_ASSET) {
-            skip(context, t.id, 'No NetSuite asset for Zendesk asset ' +
-                 (t.assetIds.length ? t.assetIds.join(', ') : '(none on ticket)'));
-            return;
-        }
-
-        // 2. Customer: from the ticket's organization, else from the asset's customer
-        var customerId = t.orgId ? findOne(search.Type.CUSTOMER, CUST_ZD_ORG_FIELD, t.orgId) : '';
-        var customerFrom = 'ticket organization';
-        if (!customerId && assetId) {
-            var a = search.lookupFields({ type: ASSET_RECORD_TYPE, id: assetId, columns: [ASSET_CUSTOMER_FIELD] });
-            var c0 = a[ASSET_CUSTOMER_FIELD];
-            customerId = Array.isArray(c0) ? (c0.length ? c0[0].value : '') : (c0 || '');
-            customerFrom = 'asset customer';
-        }
-        if (!customerId) {
-            skip(context, t.id, 'No NetSuite customer (Zendesk org ' + (t.orgId || 'none') +
-                 ', asset ' + (assetId ? 'has no customer' : 'not found') + ')');
-            return;
-        }
-
-        // 3. Create the case
-        try {
-            var c = record.create({ type: record.Type.SUPPORT_CASE });
-            c.setValue({ fieldId: 'externalid', value: 'ZD-' + t.id });
-            c.setValue({ fieldId: 'title', value: String(t.subject).slice(0, 199) });
-            c.setValue({ fieldId: 'company', value: customerId });
-            c.setValue({ fieldId: 'status', value: CASE.STATUS[t.status] || CASE.DEFAULT_STATUS });
-            c.setValue({ fieldId: 'priority', value: CASE.PRIORITY[t.priority] || CASE.DEFAULT_PRIORITY });
-            if (t.description) c.setValue({ fieldId: 'incomingmessage', value: t.description });
-            if (assetId && CASE.asset) c.setValue({ fieldId: CASE.asset, value: assetId });
-            if (CASE.zdTicketId) c.setValue({ fieldId: CASE.zdTicketId, value: String(t.id) });
-
-            var caseId = c.save({ ignoreMandatoryFields: true });
-            log.audit('CASE CREATED', { ticket: t.id, caseId: caseId, customer: customerId,
-                                        customerFrom: customerFrom, asset: assetId || '-' });
-            context.write({ key: 'ok', value: 1 });
-        } catch (e) {
-            log.error('CASE FAILED ticket ' + t.id, e.name + ': ' + e.message);
-            context.write({ key: 'failed', value: 1 });
-        }
-    }
-
-    // =====================================================
-    // SUMMARIZE
-    // =====================================================
     function summarize(summary) {
-        var totals = { ok: 0, skipped: 0, failed: 0 }, reasons = {};
-        summary.output.iterator().each(function (k, v) {
-            if (k.indexOf('reason: ') === 0) reasons[k.slice(8)] = (reasons[k.slice(8)] || 0) + Number(v);
-            else totals[k] = (totals[k] || 0) + Number(v);
-            return true;
-        });
-        if (Object.keys(reasons).length) log.audit('SKIP REASONS (count)', reasons);
         summary.inputSummary.error && log.error('INPUT ERROR', summary.inputSummary.error);
-        summary.mapSummary.errors.iterator().each(function (k, e) { log.error('MAP ERROR ' + k, e); return true; });
-        log.audit('ZENDESK -> CASE DONE', { created: totals.ok, skipped: totals.skipped, failed: totals.failed,
-                                           seconds: summary.seconds });
+        log.audit('TICKET DISCOVERY DONE', { seconds: summary.seconds });
     }
 
     return { getInputData: getInputData, map: map, summarize: summarize };
