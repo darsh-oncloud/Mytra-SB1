@@ -6,11 +6,12 @@
  * Zendesk Ticket -> NetSuite Support Case  (CREATE ONLY)
  *
  * For each Zendesk ticket:
- *   1. Organization  -> NetSuite Customer whose custentity_organization_id = ticket.organization_id
- *   2. Asset         -> NetSuite Field Service Asset whose custrecord_asset_id = asset on the ticket
- *                       (Bot asset or assembly_item, read from the ticket's asset lookup fields)
+ *   1. Asset         -> NetSuite Field Service Asset whose custrecord_asset_id = asset on the ticket
+ *                       (ITAM asset or assembly_item lookup fields on the ticket)
+ *   2. Customer      -> NetSuite Customer whose custentity_organization_id = ticket.organization_id,
+ *                       or, when the ticket has no organization, the asset's Customer
  *   3. Both found    -> create the Support Case (externalid = ZD-<ticket id>)
- *      Not found     -> skipped, reason logged (create the Org/Asset first, then re-run)
+ *      Not found     -> skipped, reason counted in SKIP REASONS (create Org/Asset first, then re-run)
  * Tickets that already have a case (externalid ZD-<id>) are skipped.
  *
  * TEST:  TEST_ALL_TICKETS = true  -> every ticket in Zendesk
@@ -46,6 +47,7 @@ function (https, record, search, log) {
     var CUST_ZD_ORG_FIELD = 'custentity_organization_id';
     var ASSET_RECORD_TYPE = 'customrecord_nx_asset';
     var ASSET_ZD_ID_FIELD = 'custrecord_asset_id';
+    var ASSET_CUSTOMER_FIELD = 'custrecord_nx_asset_customer';
 
     var CASE = {
         asset:      'custevent_nx_case_asset', // VERIFY: field help on the Case "Asset" field
@@ -90,8 +92,11 @@ function (https, record, search, log) {
     function assetFieldIds(tok) {
         if (ZD.ASSET_FIELD_IDS.length) return ZD.ASSET_FIELD_IDS.map(Number);
         var d = zget(tok, '/api/v2/ticket_fields.json');
+        // only lookups that point at real assets (ITAM asset or assembly_item), not asset types
         var ids = (d.ticket_fields || []).filter(function (f) {
-            return f.type === 'lookup' && /asset/i.test(f.title || '');
+            var target = String(f.relationship_target_type || '');
+            return f.type === 'lookup' &&
+                   (/itam_asset$/.test(target) || /custom_object:assembly_item$/.test(target));
         });
         log.audit('Asset ticket fields (auto-detected)', ids.map(function (f) {
             return f.id + ' = ' + f.title + ' -> ' + (f.relationship_target_type || '');
@@ -121,6 +126,14 @@ function (https, record, search, log) {
             return true;   // up to 4,000 - fine for this check
         });
         return ids;
+    }
+
+    // Skips are counted per reason; only the first few per run are logged individually.
+    var SKIP_LOG_LIMIT = 20, skipLogged = 0;
+    function skip(context, ticketId, reason) {
+        if (skipLogged++ < SKIP_LOG_LIMIT) log.audit('SKIPPED ticket ' + ticketId, reason);
+        context.write({ key: 'skipped', value: 1 });
+        context.write({ key: 'reason: ' + reason.replace(/[0-9A-Z]{20,}|\d{6,}/g, '#'), value: 1 });
     }
 
     function findOne(type, field, value) {
@@ -185,23 +198,29 @@ function (https, record, search, log) {
     function map(context) {
         var t = JSON.parse(context.value);
 
-        // 1. Organization -> Customer
-        var customerId = t.orgId ? findOne(search.Type.CUSTOMER, CUST_ZD_ORG_FIELD, t.orgId) : '';
-        if (!customerId) {
-            log.audit('SKIPPED ticket ' + t.id, 'No NetSuite customer for Zendesk org ' + (t.orgId || '(none on ticket)'));
-            context.write({ key: 'skipped', value: 1 });
-            return;
-        }
-
-        // 2. Asset (Bot or assembly item) -> Field Service Asset
+        // 1. Asset (Bot or assembly item) -> Field Service Asset
         var assetId = '';
         for (var i = 0; i < t.assetIds.length && !assetId; i++) {
             assetId = findOne(ASSET_RECORD_TYPE, ASSET_ZD_ID_FIELD, t.assetIds[i]);
         }
         if (!assetId && REQUIRE_ASSET) {
-            log.audit('SKIPPED ticket ' + t.id, 'No NetSuite asset for Zendesk asset ' +
-                      (t.assetIds.length ? t.assetIds.join(', ') : '(none on ticket)'));
-            context.write({ key: 'skipped', value: 1 });
+            skip(context, t.id, 'No NetSuite asset for Zendesk asset ' +
+                 (t.assetIds.length ? t.assetIds.join(', ') : '(none on ticket)'));
+            return;
+        }
+
+        // 2. Customer: from the ticket's organization, else from the asset's customer
+        var customerId = t.orgId ? findOne(search.Type.CUSTOMER, CUST_ZD_ORG_FIELD, t.orgId) : '';
+        var customerFrom = 'ticket organization';
+        if (!customerId && assetId) {
+            var a = search.lookupFields({ type: ASSET_RECORD_TYPE, id: assetId, columns: [ASSET_CUSTOMER_FIELD] });
+            var c0 = a[ASSET_CUSTOMER_FIELD];
+            customerId = Array.isArray(c0) ? (c0.length ? c0[0].value : '') : (c0 || '');
+            customerFrom = 'asset customer';
+        }
+        if (!customerId) {
+            skip(context, t.id, 'No NetSuite customer (Zendesk org ' + (t.orgId || 'none') +
+                 ', asset ' + (assetId ? 'has no customer' : 'not found') + ')');
             return;
         }
 
@@ -218,7 +237,8 @@ function (https, record, search, log) {
             if (CASE.zdTicketId) c.setValue({ fieldId: CASE.zdTicketId, value: String(t.id) });
 
             var caseId = c.save({ ignoreMandatoryFields: true });
-            log.audit('CASE CREATED', { ticket: t.id, caseId: caseId, customer: customerId, asset: assetId || '-' });
+            log.audit('CASE CREATED', { ticket: t.id, caseId: caseId, customer: customerId,
+                                        customerFrom: customerFrom, asset: assetId || '-' });
             context.write({ key: 'ok', value: 1 });
         } catch (e) {
             log.error('CASE FAILED ticket ' + t.id, e.name + ': ' + e.message);
@@ -230,8 +250,13 @@ function (https, record, search, log) {
     // SUMMARIZE
     // =====================================================
     function summarize(summary) {
-        var totals = { ok: 0, skipped: 0, failed: 0 };
-        summary.output.iterator().each(function (k, v) { totals[k] = (totals[k] || 0) + Number(v); return true; });
+        var totals = { ok: 0, skipped: 0, failed: 0 }, reasons = {};
+        summary.output.iterator().each(function (k, v) {
+            if (k.indexOf('reason: ') === 0) reasons[k.slice(8)] = (reasons[k.slice(8)] || 0) + Number(v);
+            else totals[k] = (totals[k] || 0) + Number(v);
+            return true;
+        });
+        if (Object.keys(reasons).length) log.audit('SKIP REASONS (count)', reasons);
         summary.inputSummary.error && log.error('INPUT ERROR', summary.inputSummary.error);
         summary.mapSummary.errors.iterator().each(function (k, e) { log.error('MAP ERROR ' + k, e); return true; });
         log.audit('ZENDESK -> CASE DONE', { created: totals.ok, skipped: totals.skipped, failed: totals.failed,
