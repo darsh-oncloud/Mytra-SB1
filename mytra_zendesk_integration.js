@@ -184,6 +184,7 @@ function (https, record, search, runtime, format, log) {
         // ----- Asset -----
         id:             { label: 'id',              req: true },
         name:           { label: 'name',            req: true },
+        zdId:           { label: 'zd_id',           req: true }, // THIS asset's own custrecord_asset_id
         parentId:       { label: 'parent_id',       req: true },
         parentZdId:     { label: 'parent_zd_id',    req: true },
         customerId:     { label: 'customer_id',     req: true },
@@ -530,30 +531,59 @@ function (https, record, search, runtime, format, log) {
             if (!a.parentId && String(a.id) === rootId) root = a; else children.push(a);
         });
 
+        var ok = 0, failed = 0, skipped = 0;
+
+        // ---------- children already in Zendesk -> skip ----------
+        var todo = children.filter(function (c) {
+            if (c.zdId) {
+                skipped++;
+                log.audit('CHILD SKIPPED (already has Zendesk ID)', { netsuiteId: c.id, zendeskId: c.zdId });
+                return false;
+            }
+            return true;
+        });
+
+        // ---------- parent Zendesk ID: reuse if it exists anywhere ----------
+        // 1) parent's own row in this batch  2) parent_zd_id on a child row  3) read the parent record
+        var parentZdId = (root && root.zdId) ? String(root.zdId) : '';
+        if (!parentZdId) {
+            children.forEach(function (c) { if (!parentZdId && c.parentZdId) parentZdId = String(c.parentZdId); });
+        }
+        var p = null;
+        if (!parentZdId && !root) {
+            p = readAsset(rootId);
+            if (p.zdId) parentZdId = String(p.zdId);
+        }
+
+        if (parentZdId && root) {
+            skipped++;
+            log.audit('PARENT SKIPPED (already has Zendesk ID)', { netsuiteId: rootId, zendeskAssetId: parentZdId });
+        }
+
+        // Nothing to create -> stop here (no OAuth call, no Zendesk calls)
+        if (parentZdId && !todo.length) {
+            if (skipped) context.write({ key: 'skipped', value: skipped });
+            return;
+        }
+
         var S = { token: getToken(), orgCache: {}, statuses: null, assetTypes: null };
-        var ok = 0, failed = 0;
 
-        // ---------- parent ----------
-        var parentZdId = '';
-        children.forEach(function (c) { if (c.parentZdId) parentZdId = c.parentZdId; });
-
+        // ---------- parent (only if it has no Zendesk ID anywhere) ----------
         try {
-            if (root && !parentZdId) {
-                parentZdId = createParentAsset(S, root, custFrom(root));
+            if (!parentZdId) {
+                parentZdId = root ? createParentAsset(S, root, custFrom(root))
+                                  : createParentAsset(S, p, null);
                 ok++;
-            } else if (!parentZdId && children.length) {
-                var p = readAsset(rootId);
-                parentZdId = p.zdId || createParentAsset(S, p, null);
-                if (!p.zdId) ok++;
             }
         } catch (e) {
             log.error('PARENT FAILED ' + rootId, e.message);
-            context.write({ key: 'failed', value: 1 + children.length });
+            context.write({ key: 'failed', value: (root ? 1 : 0) + todo.length });
+            if (skipped) context.write({ key: 'skipped', value: skipped });
             return; // children need the parent
         }
 
-        // ---------- children ----------
-        children.forEach(function (c) {
+        // ---------- children (only those without their own Zendesk ID) ----------
+        todo.forEach(function (c) {
             try {
                 createChild(S, c, parentZdId);
                 ok++;
@@ -565,13 +595,14 @@ function (https, record, search, runtime, format, log) {
 
         if (ok) context.write({ key: 'ok', value: ok });
         if (failed) context.write({ key: 'failed', value: failed });
+        if (skipped) context.write({ key: 'skipped', value: skipped });
     }
 
     // =====================================================
     // SUMMARIZE
     // =====================================================
     function summarize(summary) {
-        var totals = { ok: 0, failed: 0 };
+        var totals = { ok: 0, failed: 0, skipped: 0 };
         summary.output.iterator().each(function (k, v) {
             totals[k] = (totals[k] || 0) + Number(v);
             return true;
@@ -584,6 +615,7 @@ function (https, record, search, runtime, format, log) {
         log.audit('ZENDESK SYNC DONE', {
             created: totals.ok,
             failed: totals.failed,
+            skippedAlreadyInZendesk: totals.skipped,
             seconds: summary.seconds,
             usage: summary.usage
         });
