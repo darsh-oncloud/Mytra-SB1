@@ -382,7 +382,8 @@ function (https, record, search, runtime, format, log) {
     function createParentAsset(S, a, cust) {
         if (!a.name || !a.customerId) throw Error('Asset ' + a.id + ': Name or Customer missing');
 
-        var typeId = getAssetTypeId(S, a.assetType);
+        //var typeId = getAssetTypeId(S, a.assetType);
+        var typeId = getAssetTypeId(S, ZD.PARENT_TYPE_NAME);
         var orgId = getOrCreateOrg(S, a.customerId, cust);
 
         var asset = {
