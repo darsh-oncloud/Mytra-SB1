@@ -3,31 +3,42 @@
  * @NScriptType MapReduceScript
  * @NModuleScope SameAccount
  *
- * ZENDESK DISCOVERY (READ ONLY - changes nothing in Zendesk or NetSuite)
+ * ZENDESK FIELD FINDER - FINAL (READ ONLY - changes nothing in Zendesk or NetSuite)
  *
- * Run it, then open the deployment's Execution Log. Every entry title starts with
- * the section number, so sort/filter by title:
- *   1 FIELDS     all ticket fields (id, type, AGENT-ONLY or CUSTOMER-VISIBLE, dropdown values)
- *   2 STATUSES   custom ticket statuses (agent label vs. label the customer sees)
- *   3 TRIGGERS   active triggers that EMAIL THE CUSTOMER and when they fire
- *   4 TICKET     one sample ticket: status, custom status, every custom field + value
- *   5 NETSUITE   existing ZD- cases grouped by status / case type
- * Copy the log details and paste them back to Claude.
+ * Goal: find an existing Zendesk ticket field that
+ *   - the customer can NOT see        (agent-only)
+ *   - can hold text like "In Progress" (text / textarea)
+ *   - no ticket is using today         (empty on every ticket)
+ *   - agents can see on the ticket     (is on a ticket form)
+ * so NetSuite can write the case status into it later.
  *
- * No script parameters: set everything below.
+ * Execution Log (sort by Title):
+ *   1 BEST FIELD   the field to use, or why none fits
+ *   2 USE          every field that passes all checks
+ *   3 MAYBE        passes, but is not on the main form (admin must add it to the form)
+ *   4 NO           every other agent-only field + the reason
+ *   5 TAGS         is the 'ns_' tag prefix free (fallback: tag + internal note)
+ *   9 DONE
+ *
+ * No script parameters: set everything below. Read scope is enough.
  */
-define(['N/https', 'N/search', 'N/log'], function (https, search, log) {
+define(['N/https', 'N/log'], function (https, log) {
 
+    // =====================================================
+    // CONFIG
+    // =====================================================
     var ZD = {
         BASE_URL: 'https://mytra.zendesk.com',
         CLIENT_ID: 'netsuite_fsm_integration',
-        CLIENT_SECRET: '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779',   // same secret as the case Map/Reduce
-        SCOPE: 'read',
-        ASSET_FIELD_IDS: [55275377111956, 54364777978132, 47189268307348],
-        CUSTOMER_SITE_FIELD_ID: 36818231414036,
-        SERVICE_ORDER_TYPE_FIELD_ID: 54049604285972
+        CLIENT_SECRET: '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779',
+        SCOPE: 'read'
     };
-    var TEST_TICKET_ID = '458';
+    var MAIN_FORM_ID = 53680117029652;   // form used by FSM tickets (ticket 458)
+    var NS_TAG_PREFIX = 'ns_';
+
+    // Fields Zendesk itself fills in (AI summaries, employee service, etc.) - never reuse
+    var ZENDESK_MANAGED = /^(summary|multi-recipient email id|resolution type|resolution tier|channel group|required tasks|approval status)/i;
+    var TEXT_TYPES = { text: 1, textarea: 1 };
 
     // =====================================================
     // HELPERS
@@ -44,30 +55,19 @@ define(['N/https', 'N/search', 'N/log'], function (https, search, log) {
         });
         var d = parse(res.body);
         if (Number(res.code) !== 200 || !d.access_token) throw Error('OAuth failed: ' + res.code + ' ' + res.body);
-        return { tok: d.access_token, scope: d.scope || '?' };
+        return d.access_token;
     }
 
-    // GET with paging -> { ok, items, code, body }
-    function zgetAll(tok, path, key) {
-        var url = ZD.BASE_URL + path, items = [];
-        for (var g = 0; url && g < 50; g++) {
-            var res = https.get({ url: url, headers: { Authorization: 'Bearer ' + tok, Accept: 'application/json' } });
-            var d = parse(res.body);
-            if (Number(res.code) !== 200) return { ok: false, code: res.code, body: JSON.stringify(d).slice(0, 300), items: items };
-            items = items.concat(key ? (d[key] || []) : [d]);
-            url = key ? (d.next_page || (d.meta && d.meta.has_more && d.links && d.links.next) || '') : '';
-        }
-        return { ok: true, items: items };
+    function zget(tok, urlOrPath) {
+        var url = urlOrPath.indexOf('http') === 0 ? urlOrPath : ZD.BASE_URL + urlOrPath;
+        var res = https.get({ url: url, headers: { Authorization: 'Bearer ' + tok, Accept: 'application/json' } });
+        if (Number(res.code) !== 200) throw Error('GET ' + urlOrPath + ' HTTP ' + res.code + ' ' + String(res.body).slice(0, 300));
+        return parse(res.body);
     }
 
-    // Execution log details max ~3999 chars -> log lines in numbered chunks
     function dump(title, lines) {
         var chunk = '', part = 1;
-        function flush() {
-            if (!chunk) return;
-            log.audit(title + ' (part ' + part++ + ')', chunk);
-            chunk = '';
-        }
+        function flush() { if (chunk) { log.audit(title + ' (part ' + part++ + ')', chunk); chunk = ''; } }
         lines.forEach(function (l) {
             l = String(l);
             if (chunk.length + l.length + 1 > 3800) flush();
@@ -76,143 +76,103 @@ define(['N/https', 'N/search', 'N/log'], function (https, search, log) {
         flush();
     }
 
-    // =====================================================
-    // SECTIONS
-    // =====================================================
-    function loadFields(tok) {
-        var r = zgetAll(tok, '/api/v2/ticket_fields.json?page[size]=100', 'ticket_fields');
-        if (!r.ok) throw Error('ticket_fields ' + r.code + ' ' + r.body);
-        return r.items;
-    }
-
-    function secFields(tok) {
-        var known = {};
-        ZD.ASSET_FIELD_IDS.forEach(function (i) { known[i] = '<- used as ASSET'; });
-        known[ZD.CUSTOMER_SITE_FIELD_ID] = '<- used as CUSTOMER SITE';
-        known[ZD.SERVICE_ORDER_TYPE_FIELD_ID] = '<- used for CASE TYPE';
-
-        var lines = [];
-        loadFields(tok).forEach(function (f) {
-            var vis = f.visible_in_portal ? 'CUSTOMER-VISIBLE' + (f.editable_in_portal ? '+EDITABLE' : '') : 'AGENT-ONLY';
-            lines.push('[' + f.id + '] ' + f.title + ' | type=' + f.type + ' | ' + vis +
-                       ' | active=' + f.active + (f.removable === false ? ' | system' : '') + ' ' + (known[f.id] || ''));
-            if (f.visible_in_portal && f.title_in_portal) lines.push('    customer sees label: "' + f.title_in_portal + '"');
-            (f.custom_field_options || f.system_field_options || []).forEach(function (o) {
-                lines.push('    - ' + o.name + ' => ' + o.value);
-            });
-        });
-        return lines;
-    }
-
-    function secStatuses(tok) {
-        var r = zgetAll(tok, '/api/v2/custom_statuses.json', 'custom_statuses');
-        if (!r.ok) return ['Not available (' + r.code + ') - custom statuses may be off. ' + r.body];
-        return r.items.map(function (s) {
-            return '[' + s.id + '] category=' + s.status_category + ' | agent="' + s.agent_label +
-                   '" | CUSTOMER SEES="' + s.end_user_label + '" | active=' + s.active + ' | default=' + s['default'];
-        });
-    }
-
-    function secTriggers(tok) {
-        var r = zgetAll(tok, '/api/v2/triggers/active.json', 'triggers');
-        if (!r.ok) return ['Cannot read triggers (' + r.code + ') - token user may not be admin. ' + r.body];
-        var lines = [], n = 0;
-        function cond(c) { return c.field + ' ' + c.operator + ' ' + JSON.stringify(c.value); }
-        r.items.forEach(function (t) {
-            var acts = (t.actions || []).filter(function (a) {
-                return /notification|follower|side_conversation/.test(a.field) &&
-                       /requester|ccs|cc_/.test(JSON.stringify(a.value || ''));
-            });
-            if (!acts.length) return;
-            n++;
-            lines.push('[' + t.id + '] ' + t.title);
-            lines.push('   ALL: ' + ((t.conditions && t.conditions.all) || []).map(cond).join(' AND '));
-            lines.push('   ANY: ' + ((t.conditions && t.conditions.any) || []).map(cond).join(' OR '));
-            acts.forEach(function (a) { lines.push('   ACTION: ' + a.field + ' -> ' + JSON.stringify(a.value).slice(0, 150)); });
-        });
-        lines.push(n + ' of ' + r.items.length + ' active triggers notify the requester/CCs.');
-        return lines;
-    }
-
-    function secTicket(tok) {
-        var names = {};
-        try { loadFields(tok).forEach(function (f) { names[f.id] = f.title; }); } catch (e) { /* names optional */ }
-        var r = zgetAll(tok, '/api/v2/tickets/' + encodeURIComponent(TEST_TICKET_ID) + '.json', null);
-        if (!r.ok) return ['ERROR ' + r.code + ' ' + r.body];
-        var t = r.items[0].ticket, lines = [];
-        lines.push('#' + t.id + ' status=' + t.status + ' | custom_status_id=' + t.custom_status_id +
-                   ' | priority=' + t.priority + ' | type=' + t.type + ' | form=' + t.ticket_form_id +
-                   ' | via=' + (t.via && t.via.channel));
-        lines.push('tags: ' + (t.tags || []).join(', '));
-        lines.push('custom fields with a value:');
-        (t.custom_fields || []).forEach(function (c) {
-            if (c.value == null || c.value === '' || (Array.isArray(c.value) && !c.value.length)) return;
-            lines.push('   [' + c.id + '] ' + (names[c.id] || '?') + ' = ' + JSON.stringify(c.value));
-        });
-        return lines;
-    }
-
-    function secNetSuite() {
-        var lines = [];
-        search.create({
-            type: search.Type.SUPPORT_CASE,
-            filters: [['externalidstring', 'startswith', 'ZD-']],
-            columns: [
-                search.createColumn({ name: 'status', summary: 'GROUP' }),
-                search.createColumn({ name: 'custevent_nx_case_type', summary: 'GROUP' }),
-                search.createColumn({ name: 'internalid', summary: 'COUNT' })
-            ]
-        }).run().each(function (r) {
-            var c = r.columns;
-            lines.push('status=' + r.getText(c[0]) + ' (' + r.getValue(c[0]) + ') | case type=' +
-                       r.getText(c[1]) + ' (' + r.getValue(c[1]) + ') | cases=' + r.getValue(c[2]));
-            return true;
-        });
-        return lines.length ? lines : ['No ZD- cases found'];
-    }
+    function empty(v) { return v == null || v === '' || v === false || (Array.isArray(v) && !v.length); }
 
     // =====================================================
-    // GET INPUT DATA: one row per section
+    // GET INPUT DATA: does all the work, nothing to map
     // =====================================================
     function getInputData() {
-        var t = getToken();   // fail fast if the secret is wrong
-        log.audit('0 START', 'Token OK, scope granted: ' + t.scope + ' | sample ticket: ' + TEST_TICKET_ID);
-        return ['1 FIELDS', '2 STATUSES', '3 TRIGGERS', '4 TICKET', '5 NETSUITE'];
-    }
+        var tok = getToken();
 
-    // =====================================================
-    // MAP: run one section, log it
-    // =====================================================
-    function map(context) {
-        var sec = context.value;
-        try {
-            var lines;
-            if (sec === '5 NETSUITE') {
-                lines = secNetSuite();
-            } else {
-                var tok = getToken().tok;
-                lines = sec === '1 FIELDS'   ? secFields(tok)
-                      : sec === '2 STATUSES' ? secStatuses(tok)
-                      : sec === '3 TRIGGERS' ? secTriggers(tok)
-                      :                        secTicket(tok);
-            }
-            dump(sec, lines);
-            context.write({ key: 'ok', value: sec });
-        } catch (e) {
-            log.error(sec + ' FAILED', e.name + ': ' + e.message);
-            context.write({ key: 'failed', value: sec });
+        // 1. Agent-only, non-system fields
+        var fields = {}, url = '/api/v2/ticket_fields.json?page[size]=100', d, g;
+        for (g = 0; url && g < 20; g++) {
+            d = zget(tok, url);
+            (d.ticket_fields || []).forEach(function (f) {
+                if (f.visible_in_portal || f.removable === false) return;
+                fields[f.id] = { id: f.id, title: f.title, type: f.type, active: f.active,
+                                 used: 0, last: '', samples: [], forms: [] };
+            });
+            url = d.meta && d.meta.has_more ? d.links.next : '';
         }
+
+        // 2. Which ticket forms show each field
+        var formNames = {};
+        try {
+            d = zget(tok, '/api/v2/ticket_forms.json');
+            (d.ticket_forms || []).forEach(function (fm) {
+                if (!fm.active) return;
+                formNames[fm.id] = fm.name;
+                (fm.ticket_field_ids || []).forEach(function (fid) {
+                    if (fields[fid]) fields[fid].forms.push(fm.id);
+                });
+            });
+        } catch (e) { log.error('Could not read ticket forms', e.message); }
+
+        // 3. Scan every ticket for values + tags
+        var total = 0, tags = {};
+        url = '/api/v2/incremental/tickets/cursor.json?start_time=0';
+        for (g = 0; url && g < 500; g++) {
+            d = zget(tok, url);
+            (d.tickets || []).forEach(function (t) {
+                if (t.status === 'deleted') return;
+                total++;
+                (t.tags || []).forEach(function (x) { tags[x] = (tags[x] || 0) + 1; });
+                (t.custom_fields || []).forEach(function (c) {
+                    var f = fields[c.id];
+                    if (!f || empty(c.value)) return;
+                    f.used++;
+                    if (t.updated_at > f.last) f.last = t.updated_at;
+                    if (f.samples.length < 3) f.samples.push('#' + t.id + '=' + JSON.stringify(c.value).slice(0, 50));
+                });
+            });
+            url = d.end_of_stream ? '' : d.after_url;
+        }
+
+        // 4. Verdict per field
+        var use = [], maybe = [], no = [];
+        Object.keys(fields).forEach(function (id) {
+            var f = fields[id];
+            var onMain = f.forms.indexOf(MAIN_FORM_ID) >= 0;
+            var formTxt = f.forms.length ? f.forms.map(function (x) { return formNames[x] || x; }).join(', ') : 'NO FORM';
+            var line = '[' + f.id + '] ' + f.title + ' | type=' + f.type + ' | forms: ' + formTxt;
+
+            var why = '';
+            if (!f.active) why = 'inactive';
+            else if (ZENDESK_MANAGED.test(f.title)) why = 'Zendesk fills this itself';
+            else if (!TEXT_TYPES[f.type]) why = 'type ' + f.type + ' cannot hold free text';
+            else if (f.used) why = 'IN USE on ' + f.used + '/' + total + ' tickets, last ' + f.last.slice(0, 10) +
+                                   ' e.g. ' + f.samples.join(' ');
+
+            if (why) no.push(line + '  -> NO: ' + why);
+            else if (onMain) use.push(line + '  -> USE: agent-only, text, empty on all ' + total + ' tickets, on main form');
+            else maybe.push(line + '  -> MAYBE: empty and agent-only, but NOT on main form ' + MAIN_FORM_ID +
+                            ' (admin adds it to the form - no new field needed)');
+        });
+
+        // 5. Report
+        var best;
+        if (use.length) best = 'USE THIS FIELD: ' + use[0];
+        else if (maybe.length) best = 'NO field is ready. Best option after admin adds it to the form: ' + maybe[0];
+        else best = 'NO usable field. Fallback (no field needed): internal note + "' + NS_TAG_PREFIX + '" status tag.';
+        dump('1 BEST FIELD', ['Tickets scanned: ' + total + ' | agent-only fields checked: ' + Object.keys(fields).length, best]);
+        dump('2 USE', use.length ? use : ['none']);
+        dump('3 MAYBE', maybe.length ? maybe : ['none']);
+        dump('4 NO', no.length ? no : ['none']);
+
+        var nsTags = Object.keys(tags).filter(function (x) { return x.indexOf(NS_TAG_PREFIX) === 0; });
+        dump('5 TAGS', [
+            'Tags starting with "' + NS_TAG_PREFIX + '": ' + (nsTags.join(', ') || 'none - prefix is free to use'),
+            'Distinct tags in Zendesk: ' + Object.keys(tags).length
+        ]);
+        return [];
     }
 
-    // =====================================================
-    // SUMMARIZE
-    // =====================================================
+    function map(context) { }
+
     function summarize(summary) {
-        var res = { ok: [], failed: [] };
-        summary.output.iterator().each(function (k, v) { (res[k] = res[k] || []).push(v); return true; });
         summary.inputSummary.error && log.error('INPUT ERROR', summary.inputSummary.error);
-        summary.mapSummary.errors.iterator().each(function (k, e) { log.error('MAP ERROR ' + k, e); return true; });
-        log.audit('9 DISCOVERY DONE', { ok: res.ok.sort(), failed: res.failed.sort(), seconds: summary.seconds });
+        log.audit('9 DONE', { seconds: summary.seconds });
     }
 
     return { getInputData: getInputData, map: map, summarize: summarize };
