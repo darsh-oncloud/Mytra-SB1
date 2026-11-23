@@ -41,7 +41,7 @@ function (https, record, search, log) {
 
     var TEST_ALL_TICKETS = true;   // true = all tickets (testing), false = new tickets only
     var LOOKBACK_HOURS = 24;       // live mode window
-    var TEST_TICKET_ID = '';       // one ticket only, e.g. '1234'
+    var TEST_TICKET_ID = '458';       // one ticket only, e.g. '1234'
     var REQUIRE_ASSET = true;      // false = create the case with the customer only
 
     // =====================================================
@@ -65,8 +65,8 @@ function (https, record, search, log) {
 
         // Project: fixed ID, or '' = first open project of the customer
         PROJECT_ID: '',
-        // Assigned: Zendesk assignee email -> NetSuite employee email, else this employee
-        DEFAULT_ASSIGNED: '10',                       // Dhruv Soni - change as needed
+        // Assigned: every case is assigned to this employee
+        DEFAULT_ASSIGNED: '10',                       // Dhruv Soni
 
         // Case Type (custevent_nx_case_type): 5 Install, 6 Maintenance, 7 Repair, 8 Uninstall
         CASE_TYPE: {
@@ -278,12 +278,8 @@ function (https, record, search, log) {
             } catch (e) { projectId = ''; }
         }
 
-        // 4. Assigned: Zendesk assignee email -> employee, else default
-        var assignedId = '';
-        if (t.assigneeEmail) {
-            assignedId = findOne(search.Type.EMPLOYEE, [['email', 'is', t.assigneeEmail], 'AND', ['isinactive', 'is', 'F']]);
-        }
-        assignedId = assignedId || CASE.DEFAULT_ASSIGNED;
+        // 4. Assigned: always the hardcoded employee
+        var assignedId = CASE.DEFAULT_ASSIGNED;
 
         // 5. Email: requester, else customer email
         var email = t.requesterEmail;
