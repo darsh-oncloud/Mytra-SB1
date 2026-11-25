@@ -26,15 +26,15 @@ function (https, record, search, runtime, log) {
     var ZD = {
         BASE_URL: 'https://mytra.zendesk.com',
         CLIENT_ID: 'netsuite_fsm_integration',
-        CLIENT_SECRET: 'PASTE_SECRET_HERE',
+        CLIENT_SECRET: '4f1beaf8b4a16f576d75f7bc4d8e77d63ac1d07a23d6f4293036c4fe62ef5779',
         SCOPE: 'read write'                 // write is required to add the note
     };
 
     // =====================================================
     // CONFIG - NETSUITE (your new case fields)
     // =====================================================
-    var F_SEND   = 'custevent_zd_send_update';   // checkbox: "Send to Zendesk"     - CHANGE to your ID
-    var F_STATUS = 'custevent_zd_status_note';   // text area: "Zendesk Status"     - CHANGE to your ID
+    var F_SEND   = 'custevent_send_status_notes';   // checkbox: "Send to Zendesk"     - CHANGE to your ID
+    var F_STATUS = 'custevent_status_notes';   // text area: "Zendesk Status"     - CHANGE to your ID
     var EXT_PREFIX = 'ZD-';
 
     // =====================================================
